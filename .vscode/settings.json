@@ -1,0 +1,6 @@
+{
+    // Workaround: ms-python.vscode-python-envs 1.12.0 crashes with conda 26.x
+    // (expects `envs_dirs` in `conda info --envs --json`), so use legacy discovery.
+    "python.useEnvironmentsExtension": false,
+    "python.defaultInterpreterPath": "/opt/miniconda3/envs/sleep_foundation/bin/python"
+}
