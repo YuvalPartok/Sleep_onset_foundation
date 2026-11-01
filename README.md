@@ -149,3 +149,18 @@ python -c "import pandas as pd; d=pd.read_parquet('build/bandpower_mlp_muse_eval
 Each solver gets its own `build/<file>_<data>/` folder and `dist/<file>_<data>.zip`.
 The exported file is always renamed to `submission.py` inside the ZIP, as Codabench requires.
 Test a new model on `--data simulated` first; it takes seconds and catches most shape bugs.
+
+## Train on Google Colab
+
+`colab/train_on_colab.ipynb` rebuilds the project on a Colab GPU: it clones the
+harness at the pinned commit, embeds `submission/*.py` and
+`scripts/build_submission.py`, downloads the Muse data (cached in Drive), trains
+the runs listed in its `RUNS` cell and saves `build/`/`dist/` outputs to Drive.
+After editing the solver locally, regenerate it:
+
+```bash
+python scripts/make_colab_notebook.py
+```
+
+Upload it at colab.research.google.com (File → Upload notebook), pick a GPU
+runtime and Run all.
