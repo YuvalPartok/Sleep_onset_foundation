@@ -81,9 +81,11 @@ def main() -> int:
     # 1. Train and export.
     run(common + ["-o", "Sleep-onset[training=True]", "-s", str(solver),
                   "--output", str(ROOT / "build" / f"{label}_train.parquet")], env)
-    for name in ("submission.py", "weights.pt"):
-        if not (build_dir / name).is_file():
-            raise SystemExit(f"training run did not export {name}")
+    if not (build_dir / "submission.py").is_file():
+        raise SystemExit("training run did not export submission.py")
+    if not any(p.is_file() and p.name != "submission.py"
+               for p in build_dir.iterdir()):
+        raise SystemExit("training run did not export any weights file")
 
     # 2. Reload the exported folder inference-only, as Codabench does.
     run(common + ["-o", "Sleep-onset[training=False]",

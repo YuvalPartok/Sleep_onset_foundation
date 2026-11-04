@@ -70,10 +70,23 @@ USE_DRIVE = True    # cache the data and save the results in Google Drive
 DRIVE_DIR = Path("/content/drive/MyDrive/EEG_sleep_foundation")
 """),
         code("""
+# Drive can only be mounted by the Google account running this Colab session.
+# Picking a different account in the popup fails with "credential
+# propagation was unsuccessful": open this notebook while signed in to Colab
+# as the account whose Drive you want to use.
 if USE_DRIVE:
     from google.colab import drive
-    drive.mount("/content/drive")
-    DRIVE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        drive.mount("/content/drive")
+        DRIVE_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as err:
+        USE_DRIVE = False
+        print(f"Drive not mounted ({err}).\\n"
+              "Continuing WITHOUT Drive: the data is downloaded again and "
+              "results are not saved if the runtime disconnects. Download "
+              "them with the last cell.\\n"
+              "To use Drive, run this notebook in Colab signed in as the "
+              "account that owns that Drive.")
 """),
         md("## Code: official harness + this project's files"),
         code("""
@@ -97,6 +110,28 @@ for sub in ("submission", "scripts", "build", "dist"):
         code("""
 !pip install -q -r competition/requirements.txt
 """),
+        md("""
+neuralbench asks for its folders (CACHE_DIR, SAVE_DIR, DATA_DIR, W&B) on first
+use. The harness overrides those paths with its own data folder, so write the
+config here and skip the interactive prompt.
+"""),
+        code("""
+import json
+nb_config = Path.home() / ".neuralbench" / "config.json"
+if not nb_config.exists():
+    base = Path("/content/neuralbench")
+    nb_config.parent.mkdir(parents=True, exist_ok=True)
+    nb_config.write_text(json.dumps({
+        "USER": "colab", "ENTITY_NAME": "colab", "PROJECT_NAME": "neuralbench",
+        "SLURM_PARTITION": "", "SLURM_CONSTRAINT": "", "N_CPUS": 2,
+        "CLUSTER": None,
+        "CACHE_DIR": str(base / "cache"), "SAVE_DIR": str(base / "save"),
+        "DATA_DIR": str(base / "data"), "WANDB_HOST": "",
+    }, indent=2))
+    for sub in ("cache", "save", "data"):
+        (base / sub).mkdir(parents=True, exist_ok=True)
+print(nb_config.read_text())
+"""),
         md("## Muse data: from the Drive cache, else download from NEMAR"),
         code("""
 DATA = PROJECT / "competition/tracks/sleep_onset/data"
@@ -115,77 +150,367 @@ if CACHE is not None and not CACHE.exists():
 """),
         md("## Smoke test on synthetic data (seconds; the score is meaningless)"),
         code("""
-!SLEEP_N_SEEDS=1 python scripts/build_submission.py --solver submission/cnn_gru.py --force 2>&1 | grep -E "CNN-GRU|Error|Ready"
+!SLEEP_N_SEEDS=1 python scripts/build_submission.py --solver submission/cnn_gru.py --label smoke_cnn --force 2>&1 | grep -E "CNN-GRU\\\\]|Error|Ready"
+!python scripts/build_submission.py --solver submission/gbm.py --label smoke_gbm --force 2>&1 | grep -E "GBM\\\\] (ensemble|[0-9]+ train)|Error|Ready"
 """),
         md("""
-## Train on Muse
+## Experiments
 
-Each run trains `Solver.fit` on the GPU, re-runs the exported folder
-inference-only (as Codabench does) and writes `dist/<label>.zip`.
-`SLEEP_N_SEEDS` = ensemble size, `SLEEP_ADAPT` = per-sleeper adaptation.
-Only the `[CNN-GRU ...]` progress lines are shown; the full log goes to
-`build/<label>.log`.
+Every run is scored two ways:
+
+* **val W-bMAE**: 15% of the training *sleepers*, held out and identical for
+  every run and both solvers. These sleepers are never trained on, so this
+  approximates the **unseen** half of the sealed test.
+* **test W-bMAE**: the 40 warm-up recordings (sleepers **seen** in training),
+  scored inference-only as on Codabench.
+
+**Round 2** (default, `ROUND = 2`) tests the three changes made after round 1,
+all on the GRU without the CNN, 3 seeds each:
+
+| Run | Extra recordings | Drowsiness and trend features |
+|---|---|---|
+| `r2_base` | no | no (= round 1's `cnn_gru_no_cnn`) |
+| `r2_extra` | yes | no |
+| `r2_feats` | no | yes |
+| `r2_feats_extra` | yes | yes (the new default) |
+
+* **Extra recordings**: NeuralBench's own validation sleepers from the public
+  training release (about 88 recordings), which the harness's train loader
+  leaves out.
+* **Drowsiness features**: slow eye-movement power on AF7−AF8, spectral entropy
+  and edge, plus each feature's change over the last ~1 min and its trend
+  against the recording's mean.
+
+`ROUND = 1` reruns the bottleneck experiments (CNN vs no CNN, learning curve,
+GBM). Finished runs are saved in Drive and skipped on a re-run, so after a
+disconnect just **Run all** again.
+
+`RUN_PRODUCTION = True` also builds the 5-member submission with the settings
+in `PRODUCTION_ENV` (the defaults = no CNN, new features, extra recordings).
+To build only the submission, also set `RUN_EXPERIMENTS = False`. Finished
+experiments are restored from Drive anyway, but without Drive they would
+retrain.
 """),
         code("""
 import os, shutil
 
-RUNS = [
-    # (label,              n_seeds, adapt)
-    ("cnn_gru_adapt",      1, True),
-    ("cnn_gru_ens_adapt",  5, True),
-    ("cnn_gru_ens",        5, False),
-]
+ROUND = 2
+SEEDS = [0, 1, 2]
+RUN_EXPERIMENTS = True      # the experiment runs of ROUND (False: skip them)
+RUN_PRODUCTION = False      # build the 5-member submission ensemble
+PRODUCTION_LABEL = "gru_ens5"
+PRODUCTION_ENV = {"SLEEP_N_SEEDS": "5"}   # defaults: no CNN, feats 2, extra data
 
-def build(label, n_seeds, adapt):
-    env = {**os.environ, "SLEEP_N_SEEDS": str(n_seeds),
-           "SLEEP_ADAPT": "1" if adapt else "0"}
-    log_path = PROJECT / "build" / f"{label}.log"
+GBM, CNN = "submission/gbm.py", "submission/cnn_gru.py"
+# Round 1 settings spelled out, since the solver defaults changed after it.
+V1 = {"SLEEP_N_SEEDS": "1", "SLEEP_ADAPT": "1", "SLEEP_USE_CNN": "1",
+      "SLEEP_FEATS": "1", "SLEEP_EXTRA_DATA": "0"}
+GRU = {"SLEEP_N_SEEDS": "1", "SLEEP_ADAPT": "1", "SLEEP_USE_CNN": "0"}
+EXPERIMENTS = {
+    1: [  # (name,           solver, env)
+        ("gbm_time",         GBM, {"SLEEP_GBM_FEATURES": "time"}),
+        ("gbm_all",          GBM, {}),
+        ("gbm_frac25",       GBM, {"SLEEP_TRAIN_FRAC": "0.25"}),
+        ("gbm_frac50",       GBM, {"SLEEP_TRAIN_FRAC": "0.5"}),
+        ("cnn_gru_full",     CNN, V1),
+        ("cnn_gru_no_cnn",   CNN, {**V1, "SLEEP_USE_CNN": "0"}),
+        ("cnn_gru_frac25",   CNN, {**V1, "SLEEP_TRAIN_FRAC": "0.25"}),
+        ("cnn_gru_frac50",   CNN, {**V1, "SLEEP_TRAIN_FRAC": "0.5"}),
+    ],
+    2: [
+        ("r2_base",          CNN, {**GRU, "SLEEP_FEATS": "1", "SLEEP_EXTRA_DATA": "0"}),
+        ("r2_extra",         CNN, {**GRU, "SLEEP_FEATS": "1", "SLEEP_EXTRA_DATA": "1"}),
+        ("r2_feats",         CNN, {**GRU, "SLEEP_FEATS": "2", "SLEEP_EXTRA_DATA": "0"}),
+        ("r2_feats_extra",   CNN, {**GRU, "SLEEP_FEATS": "2", "SLEEP_EXTRA_DATA": "1"}),
+    ],
+}[ROUND]
+RUNS = [(f"{name}_s{seed}", solver, {**env, "SLEEP_SEED": str(seed)})
+        for name, solver, env in EXPERIMENTS for seed in SEEDS
+        if RUN_EXPERIMENTS]
+if RUN_PRODUCTION:
+    RUNS.append((PRODUCTION_LABEL, CNN, PRODUCTION_ENV))
+
+BUILD = PROJECT / "build"
+RESULTS = DRIVE_DIR / "results" if USE_DRIVE else None
+
+def run_files(label):
+    return [p for p in BUILD.glob(f"{label}_*") if p.is_file()] + \\
+           [BUILD / f"{label}.log"]
+
+def restore(label):
+    \"\"\"Copy a finished run back from Drive; True if it was there.\"\"\"
+    if RESULTS is None or not (RESULTS / f"{label}_eval.parquet").exists():
+        return False
+    for name in ("eval.parquet", "train.parquet", "valpred.npz"):
+        src = RESULTS / f"{label}_{name}"
+        if src.exists():
+            shutil.copy(src, BUILD)
+    if (RESULTS / f"{label}.log").exists():
+        shutil.copy(RESULTS / f"{label}.log", BUILD)
+    return True
+
+def build(label, solver, env_extra):
+    env = {**os.environ, **env_extra}
+    log_path = BUILD / f"{label}.log"
     cmd = ["python", "scripts/build_submission.py", "--data", "muse",
-           "--solver", "submission/cnn_gru.py", "--label", label, "--force"]
+           "--solver", solver, "--label", label, "--force"]
     with open(log_path, "w") as log:
         proc = subprocess.Popen(cmd, cwd=PROJECT, env=env, text=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         for line in proc.stdout:
             log.write(line)
-            if "CNN-GRU" in line or "Error" in line or "Ready" in line:
+            if any(k in line for k in ("[CNN-GRU", "[GBM]", "Error", "Ready")):
                 print(line, end="")
     if proc.wait() != 0:
         raise RuntimeError(f"{label} failed; see {log_path}")
-    if USE_DRIVE:
-        out = DRIVE_DIR / "results"
-        out.mkdir(exist_ok=True)
-        shutil.copytree(PROJECT / "build" / label, out / label, dirs_exist_ok=True)
-        for f in (PROJECT / "build").glob(f"{label}*.*"):
-            shutil.copy(f, out)
-        shutil.copy(PROJECT / "dist" / f"{label}.zip", out)
+    if RESULTS is not None:
+        RESULTS.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(BUILD / label, RESULTS / label, dirs_exist_ok=True)
+        for f in run_files(label):
+            if f.exists():
+                shutil.copy(f, RESULTS)
+        shutil.copy(PROJECT / "dist" / f"{label}.zip", RESULTS)
 
-for label, n_seeds, adapt in RUNS:
-    print(f"===== {label}: {n_seeds} seed(s), adapt={adapt}")
-    build(label, n_seeds, adapt)
+for label, solver, env_extra in RUNS:
+    if restore(label):
+        print(f"===== {label}: restored from Drive")
+        continue
+    print(f"===== {label}: {env_extra}")
+    build(label, solver, env_extra)
 """),
-        md("## Results (test W-bMAE on the 40 Muse warm-up recordings)"),
+        md("""
+## 1. Summary
+
+Mean ± std over seeds. `gap` = test − val: how much easier seen sleepers are
+than unseen ones. The constant row is a 35 s constant (the published floor),
+scored on the same validation recordings.
+"""),
         code("""
 import re
+import numpy as np
 import pandas as pd
 
+EDGES = np.array([0, 40, 90, 300, 600.0])
+WEIGHTS = np.array([10, 5, 3, 1.0])
+
+def range_of(y):
+    return np.clip(np.digitize(y, EDGES[1:-1]), 0, len(WEIGHTS) - 1)
+
+def wbmae(y, p):
+    \"\"\"W-bMAE of one recording, as benchmark_utils.metrics.binned_mae.\"\"\"
+    keep = (y >= EDGES[0]) & (y <= EDGES[-1])      # out-of-range targets ignored
+    y, p = y[keep], p[keep]
+    r, err = range_of(y), np.abs(p - y)
+    present = np.unique(r)
+    return sum(WEIGHTS[b] * err[r == b].mean() for b in present) / WEIGHTS[present].sum()
+
+def score(df, col="pred"):
+    return np.mean([wbmae(g.y.values, g[col].values) for _, g in df.groupby("record")])
+
+def valpred(label):
+    f = BUILD / f"{label}_valpred.npz"
+    if not f.exists():
+        return None
+    d = np.load(f)
+    return pd.DataFrame({k: d[k] for k in ("record", "subject", "position", "y", "pred")})
+
+def experiment(label):
+    return re.sub(r"_s\\d+$", "", label)
+
 rows = []
-for label, n_seeds, adapt in RUNS:
-    eval_file = PROJECT / "build" / f"{label}_eval.parquet"
+for label, _, _ in RUNS:
+    eval_file = BUILD / f"{label}_eval.parquet"
     if not eval_file.exists():
         continue
     d = pd.read_parquet(eval_file).filter(like="objective_").iloc[-1]
-    log = (PROJECT / "build" / f"{label}.log").read_text()
+    log = (BUILD / f"{label}.log").read_text() if (BUILD / f"{label}.log").exists() else ""
     val = re.findall(r"ensemble val W-bMAE ([\\d.]+)", log)
-    rows.append({"label": label, "seeds": n_seeds, "adapt": adapt,
-                 "val W-bMAE": float(val[-1]) if val else None,
-                 "test W-bMAE": d["objective_wbmae_recording_mean"],
-                 "bMAE": d["objective_bmae"], "MAE": d["objective_mae"]})
-pd.DataFrame(rows).round(1)
+    rows.append({"experiment": experiment(label), "label": label,
+                 "val": float(val[-1]) if val else np.nan,
+                 "test": d["objective_wbmae_recording_mean"],
+                 "test bMAE": d["objective_bmae"], "test MAE": d["objective_mae"]})
+runs = pd.DataFrame(rows, columns=["experiment", "label", "val", "test",
+                                   "test bMAE", "test MAE"])
+
+summary = runs.groupby("experiment", sort=False).agg(
+    seeds=("label", "size"),
+    val=("val", "mean"), val_std=("val", "std"),
+    test=("test", "mean"), test_std=("test", "std"))
+summary["gap (test-val)"] = summary.test - summary.val
+
+any_val = next((valpred(l) for l in runs.label if valpred(l) is not None), None)
+if any_val is not None:
+    const = any_val.assign(pred=35.0)
+    summary.loc["constant_35s"] = {"seeds": 0, "val": score(const)}
+summary.round(1)
 """),
-        md("Download a submission ZIP to your computer (also in Drive under `results/`):"),
+        md("## 2. Learning curve (round 1 only): val W-bMAE vs share of training sleepers"),
         code("""
+import matplotlib.pyplot as plt
+
+FAMILIES = {   # name: (color, {train fraction: experiment})
+    "CNN-GRU": ("#2a78d6", {0.25: "cnn_gru_frac25", 0.5: "cnn_gru_frac50", 1.0: "cnn_gru_full"}),
+    "GBM":     ("#eb6834", {0.25: "gbm_frac25", 0.5: "gbm_frac50", 1.0: "gbm_all"}),
+}
+if not any(e in summary.index for _, pts in FAMILIES.values() for e in pts.values()):
+    print("No learning-curve runs in this round (ROUND = 1 has them).")
+else:
+    fig, ax = plt.subplots(figsize=(7, 4.2))
+    for name, (color, points) in FAMILIES.items():
+        xs = [f for f, e in points.items() if e in summary.index]
+        if not xs:
+            continue
+        m = np.array([summary.loc[points[f], "val"] for f in xs])
+        s = np.nan_to_num(np.array([summary.loc[points[f], "val_std"] for f in xs]))
+        ax.plot(xs, m, "-o", color=color, lw=2, ms=8, label=name)
+        ax.fill_between(xs, m - s, m + s, color=color, alpha=0.15, lw=0)
+        ax.annotate(name, (xs[-1], m[-1]), xytext=(8, 0), textcoords="offset points",
+                    va="center", color="#333")
+    if "constant_35s" in summary.index:
+        ax.axhline(summary.loc["constant_35s", "val"], color="#888", lw=1, ls="--")
+        ax.annotate("constant 35 s", (0.25, summary.loc["constant_35s", "val"]),
+                    xytext=(0, 4), textcoords="offset points", color="#666", fontsize=9)
+    ax.set_xscale("log", base=2)
+    ax.set_xticks([0.25, 0.5, 1.0], ["25%", "50%", "100%"])
+    ax.set_xlim(0.22, 1.35)
+    ax.set_xlabel("share of training sleepers used")
+    ax.set_ylabel("val W-bMAE, unseen sleepers (s, lower is better)")
+    ax.grid(axis="y", color="#e5e5e5", lw=0.8)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.legend(frameon=False, loc="best")
+    plt.tight_layout(); plt.show()
+"""),
+        md("""
+## 3. Where does the error come from?
+
+Per range of the true time-to-N2, on the validation recordings (all seeds
+pooled): the MAE, and how many seconds of the W-bMAE each range contributes
+(the contributions sum to the score). The range with the largest
+contribution is where improvements pay off most. The 0–40 s range carries
+weight 10, so it usually dominates.
+"""),
+        code("""
+LABELS = ["0-40 s", "40-90 s", "90-300 s", "300-600 s"]
+
+def breakdown(df):
+    mae = {b: [] for b in range(4)}
+    contrib = np.zeros(4)
+    n_rec = 0
+    for _, g in df.groupby(["seed", "record"]):
+        g = g[(g.y >= EDGES[0]) & (g.y <= EDGES[-1])]
+        r = range_of(g.y.values)
+        err = np.abs(g.pred.values - g.y.values)
+        present = np.unique(r)
+        for b in present:
+            mae[b].append(err[r == b].mean())
+            contrib[b] += WEIGHTS[b] * err[r == b].mean() / WEIGHTS[present].sum()
+        n_rec += 1
+    out = {f"MAE {LABELS[b]}": np.mean(mae[b]) if mae[b] else np.nan for b in range(4)}
+    out.update({f"share {LABELS[b]}": contrib[b] / n_rec for b in range(4)})
+    return out
+
+rows = {}
+for exp in summary.index:
+    parts = [valpred(l).assign(seed=l) for l in runs.label[runs.experiment == exp]
+             if valpred(l) is not None]
+    if parts:
+        rows[exp] = breakdown(pd.concat(parts))
+if any_val is not None:
+    rows["constant_35s"] = breakdown(any_val.assign(pred=35.0, seed=0))
+pd.DataFrame(rows).T.round(1)
+"""),
+        md("""
+### Timing near onset
+
+Median prediction (s) by true time to N2, on the validation recordings. A
+well-timed model follows the diagonal: about 10 at 0–20 s, 50 at 40–60 s and
+so on. In round 1 the model squeezed everything below 150 s into 20–60 s, so it
+called onset too early.
+"""),
+        code("""
+BINS = [-1, 20, 40, 60, 90, 150, 300, 601]
+cols = {}
+for exp in summary.index:
+    parts = [valpred(l) for l in runs.label[runs.experiment == exp]
+             if valpred(l) is not None]
+    if parts:
+        d = pd.concat(parts)
+        cols[exp] = d.groupby(pd.cut(d.y, BINS), observed=True).pred.median()
+timing = pd.DataFrame(cols)
+timing.index = [f"{max(0, iv.left):.0f}-{min(600, iv.right):.0f} s" for iv in timing.index]
+timing.index.name = "true time to N2"
+timing.round(0)
+"""),
+        md("""
+## 4. Blend: GBM + CNN-GRU (round 1 only)
+
+`w·GBM + (1−w)·CNN-GRU`, scored on the validation recordings. These
+recordings also pick `w`, so the gain is slightly optimistic; a gain of only a
+second or two is noise.
+"""),
+        code("""
+def blend_curve(a_exp, b_exp):
+    curves = []
+    for seed in SEEDS:
+        a, b = valpred(f"{a_exp}_s{seed}"), valpred(f"{b_exp}_s{seed}")
+        if a is None or b is None:
+            continue
+        m = a.merge(b[["record", "position", "pred"]], on=["record", "position"],
+                    suffixes=("_a", "_b"))
+        ws = np.linspace(0, 1, 11)
+        curves.append([score(m.assign(pred=w * m.pred_a + (1 - w) * m.pred_b))
+                       for w in ws])
+    if not curves:
+        return None
+    return pd.Series(np.mean(curves, axis=0), index=np.linspace(0, 1, 11).round(1))
+
+blends = {f"gbm_all + {cnn}": blend_curve("gbm_all", cnn)
+          for cnn in ("cnn_gru_full", "cnn_gru_no_cnn")}
+blends = pd.DataFrame({k: v for k, v in blends.items() if v is not None})
+if not blends.empty:
+    blends.index.name = "w (GBM share)"
+    for col in blends:
+        best = blends[col].idxmin()
+        print(f"{col}: best w = {best}, val W-bMAE {blends[col].min():.1f} "
+              f"(GBM alone {blends[col][1.0]:.1f}, CNN-GRU alone {blends[col][0.0]:.1f})")
+if blends.empty:
+    print("No GBM runs in this round (ROUND = 1 has them).")
+blends.round(1)
+"""),
+        md("""
+## 5. Decide
+
+**Round 2.** Compare each run with `r2_base`, using validation first (the
+unseen sleepers, 60 recordings) and test second. A change counts only if it
+beats `r2_base` by more than about the seeds' std.
+
+* **`r2_extra` better:** more data helps, as the round-1 learning curve
+  suggested. Keep it on; external data (ANPHY, NSRR) is then worth a try.
+* **`r2_feats` better, especially in the 0–40 and 40–90 s shares and in the
+  timing table:** the drowsiness features help find onset. Keep them.
+* **`r2_feats_extra` best:** build the submission with `RUN_PRODUCTION = True`
+  (these are the defaults).
+* **One change hurts:** turn it off in `PRODUCTION_ENV`, e.g.
+  `"SLEEP_FEATS": "1"` or `"SLEEP_EXTRA_DATA": "0"`.
+
+**Round 1** (`ROUND = 1`): CNN vs no CNN, the learning curve, GBM vs GRU; see
+the reading guide at the top of the experiments.
+"""),
+        md("Download all results (tables, logs, validation predictions) as one ZIP:"),
+        code("""
+import zipfile
 from google.colab import files
-files.download(str(PROJECT / "dist" / "cnn_gru_ens_adapt.zip"))
+
+out = PROJECT / "experiment_results.zip"
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+    for label, _, _ in RUNS:
+        for f in run_files(label):
+            if f.exists():
+                zf.write(f, f.name)
+files.download(str(out))
+if RUN_PRODUCTION and (PROJECT / "dist" / f"{PRODUCTION_LABEL}.zip").exists():
+    files.download(str(PROJECT / "dist" / f"{PRODUCTION_LABEL}.zip"))
 """),
     ]
     nb = {"cells": cells, "metadata": {

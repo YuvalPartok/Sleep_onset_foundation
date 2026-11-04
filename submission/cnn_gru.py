@@ -1,20 +1,24 @@
-"""Track 03 (Sleep Onset) submission: an ensemble of CNN + band powers -> GRU
+"""Track 03 (Sleep Onset) submission: an ensemble of spectral-feature -> GRU
 models that each output a time-to-N2 distribution.
 
-Each 5 s window goes through two encoders:
-- a 1-D CNN on the raw signal, to learn waveform shapes (alpha/theta
-  rhythms, slow eye movements on AF7/AF8, spindles, K-complexes);
+Each 5 s window is summarised by hand-crafted spectral features:
 - log band powers (delta, theta, alpha, sigma, beta, high/EMG), absolute and
-  relative, the classic sleep-scoring markers.
-Their features, plus the time elapsed since the recording started, feed a
-GRU that keeps its state across the windows of a recording (streamed
-evaluation: one window per ``predict`` call, ``reset_state`` per recording).
+  relative, and the theta/alpha ratio: the classic sleep-scoring markers;
+- with ``feats=2`` (default) also drowsiness markers: slow (< 0.6 Hz) power
+  per channel and on the AF7-AF8 derivation (slow eye movements), 0.6-4 Hz
+  power on AF7-AF8, spectral entropy and 95 % spectral edge per channel.
+Optionally (``use_cnn``, off by default since the bottleneck experiments
+showed it does not help with this much data) a 1-D CNN on the raw signal
+adds learned waveform features.
+These, plus the time elapsed since the recording started, feed a GRU that
+keeps its state across the windows of a recording (streamed evaluation: one
+window per ``predict`` call, ``reset_state`` per recording).
 
-Per-sleeper adaptation (``adapt``): the CNN input is scaled by the
-recording's own running RMS per channel, and the band powers are also given
-relative to the recording's running mean, so each window is judged against
-the same sleeper's history. Both statistics are causal expanding means over
-the windows seen so far.
+Per-sleeper adaptation (``adapt``): the features are also given relative to
+the recording's running mean, so each window is judged against the same
+sleeper's history; with ``feats=2`` also relative to a ~1 min EMA (the
+short-term change) and the EMA relative to the running mean (the trend).
+All statistics are causal, over the windows seen so far.
 
 The head outputs a distribution over the time to the first N2 epoch, in
 5 s bins (0, 5, ..., 595, 600 = capped). The ensemble averages the members'
@@ -60,6 +64,19 @@ DROPOUT = 0.2
 # Training-time choices; inference reads them back from weights.pt.
 N_SEEDS = int(os.environ.get("SLEEP_N_SEEDS", 5))
 ADAPT = os.environ.get("SLEEP_ADAPT", "1") == "1"
+# Raw-signal CNN branch (off: it did not help in the bottleneck experiments)
+# and the feature set (1 = band powers only, 2 = + drowsiness and trend).
+USE_CNN = os.environ.get("SLEEP_USE_CNN", "0") == "1"
+FEATS = int(os.environ.get("SLEEP_FEATS", 2))
+# Also train on NeuralBench's own validation sleepers of the public Muse
+# training release, which the harness's train loader leaves out.
+EXTRA_DATA = os.environ.get("SLEEP_EXTRA_DATA", "1") == "1"
+# Diagnostics (see colab notebook): train on a fraction of the training
+# sleepers, change the members' seed. The validation sleepers do not depend
+# on any of these settings, so runs stay comparable.
+TRAIN_FRAC = float(os.environ.get("SLEEP_TRAIN_FRAC", 1.0))
+MEMBER_SEED = int(os.environ.get("SLEEP_SEED", 0))
+EMA_S = 60.0                             # short-term EMA time constant
 
 EPOCHS = 30
 PATIENCE = 8
@@ -71,7 +88,7 @@ VAL_FRACTION = 0.15
 LABEL_SIGMA = 1.5                        # soft-label width, in bins
 L1_WEIGHT = 0.1
 QUANTILES = (0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6)
-SEED = 0
+SEED = 0                                 # validation split seed (fixed)
 
 
 def preprocess(X):
@@ -91,16 +108,19 @@ def quantile_seconds(p, q):
 class SleepOnsetCNNGRU(nn.Module):
     """One member: (B, L, C, T) sequences -> logits (B, L, K) over bins."""
 
-    def __init__(self, n_chans, n_times, sfreq, adapt=ADAPT):
+    def __init__(self, n_chans, n_times, sfreq, adapt=ADAPT, use_cnn=USE_CNN,
+                 feats=FEATS):
         super().__init__()
         self.n_chans, self.n_times, self.sfreq = n_chans, n_times, sfreq
         self.window_s = n_times / sfreq
         self.use_adapt = bool(adapt)
+        self.use_cnn = bool(use_cnn)
+        self.n_feats = int(feats)
+        self.ema_alpha = min(1.0, self.window_s / EMA_S)
         self.register_buffer("adapt", torch.tensor(self.use_adapt))
+        self.register_buffer("cnn_on", torch.tensor(self.use_cnn))
+        self.register_buffer("feats", torch.tensor(self.n_feats))
         self.register_buffer("chan_std", torch.ones(n_chans))
-        n_bp = 2 * len(BANDS) * n_chans + n_chans
-        self.register_buffer("bp_mean", torch.zeros(n_bp))
-        self.register_buffer("bp_std", torch.ones(n_bp))
         self.register_buffer(
             "bin_values", torch.arange(N_BINS, dtype=torch.float32) * BIN_S)
 
@@ -112,6 +132,17 @@ class SleepOnsetCNNGRU(nn.Module):
         self.register_buffer("band_masks", masks, persistent=False)
         self.register_buffer("hann", torch.hann_window(n_times),
                              persistent=False)
+        self.register_buffer("freqs", freqs, persistent=False)
+        self.register_buffer("slow_mask", ((freqs > 0) & (freqs < 0.6)).float(),
+                             persistent=False)
+        self.register_buffer("eog_mask", ((freqs >= 0.6) & (freqs < 4.0))
+                             .float(), persistent=False)
+        self.register_buffer("broad_mask", ((freqs >= 0.5)
+                                            & (freqs < min(30.0, nyq))),
+                             persistent=False)
+        n_bp = self.band_powers(torch.zeros(1, n_chans, n_times)).shape[1]
+        self.register_buffer("bp_mean", torch.zeros(n_bp))
+        self.register_buffer("bp_std", torch.ones(n_bp))
 
         layers, in_ch = [], n_chans
         kernels = (max(3, int(sfreq // 2)) | 1, 9, 7, 5)
@@ -119,11 +150,13 @@ class SleepOnsetCNNGRU(nn.Module):
             layers += [nn.Conv1d(in_ch, out_ch, k, padding=k // 2, bias=False),
                        nn.BatchNorm1d(out_ch), nn.GELU(), nn.MaxPool1d(2)]
             in_ch = out_ch
-        self.cnn = nn.Sequential(*layers)
-        bp_in = n_bp * (2 if self.use_adapt else 1)
+        self.cnn = nn.Sequential(*layers) if self.use_cnn else None
+        bp_in = n_bp * ((4 if self.n_feats >= 2 else 2) if self.use_adapt
+                        else 1)
         self.bp_proj = nn.Sequential(nn.Linear(bp_in, BP_DIM), nn.GELU())
+        cnn_dim = 2 * CNN_CHANNELS[-1] if self.use_cnn else 0
         self.in_proj = nn.Sequential(
-            nn.Linear(2 * CNN_CHANNELS[-1] + BP_DIM + 1, GRU_HIDDEN),
+            nn.Linear(cnn_dim + BP_DIM + 1, GRU_HIDDEN),
             nn.GELU(), nn.Dropout(DROPOUT))
         self.gru = nn.GRU(GRU_HIDDEN, GRU_HIDDEN, GRU_LAYERS, batch_first=True,
                           dropout=DROPOUT)
@@ -139,15 +172,33 @@ class SleepOnsetCNNGRU(nn.Module):
         log_rel = torch.log(power / (power.sum(-1, keepdim=True) + 1e-6)
                             + 1e-6)
         theta_alpha = log_abs[..., 1] - log_abs[..., 2]
-        return torch.cat([log_abs.flatten(1), log_rel.flatten(1),
-                          theta_alpha], dim=1)
+        out = [log_abs.flatten(1), log_rel.flatten(1), theta_alpha]
+        if self.n_feats >= 2:
+            # Drowsiness: slow eye movements (< 0.6 Hz, strongest on the
+            # AF7-AF8 derivation, where horizontal eye movements are of
+            # opposite polarity), spectral flattening (entropy, edge).
+            out.append(torch.log(spec @ self.slow_mask + 1e-6))
+            a, b = (1, 2) if X.shape[1] >= 3 else (0, X.shape[1] - 1)
+            eog = torch.fft.rfft((X[:, a] - X[:, b]) * self.hann,
+                                 dim=-1).abs() ** 2
+            out.append(torch.stack([torch.log(eog @ self.slow_mask + 1e-6),
+                                    torch.log(eog @ self.eog_mask + 1e-6)],
+                                   dim=1))
+            p = spec[..., self.broad_mask]
+            p = p / (p.sum(-1, keepdim=True) + 1e-12)
+            out.append(-(p * torch.log(p + 1e-12)).sum(-1)
+                       / np.log(p.shape[-1]))
+            edge = (p.cumsum(-1) >= 0.95).float().argmax(-1)
+            out.append(self.freqs[self.broad_mask][edge] / 30.0)
+        return torch.cat(out, dim=1)
 
     def encode(self, X, start_index, sums):
         """Sequences (B, L, C, T) -> GRU inputs (B, L, H), new running sums.
 
         ``sums`` = (sum of band powers (B, F), sum of channel variances
-        (B, C), window count (B, 1)) over the earlier windows of each
-        recording, or None at its start.
+        (B, C), window count (B, 1), short-term EMA of the band powers
+        (B, F)) over the earlier windows of each recording, or None at its
+        start.
         """
         B, L, C, T = X.shape
         Xf = preprocess(X.reshape(B * L, C, T))
@@ -157,27 +208,41 @@ class SleepOnsetCNNGRU(nn.Module):
             var = Xf.var(-1).reshape(B, L, C)
             if sums is None:
                 sums = (bp.new_zeros(B, bp.shape[-1]), var.new_zeros(B, C),
-                        var.new_zeros(B, 1))
+                        var.new_zeros(B, 1), None)
             count = sums[2].unsqueeze(1) + torch.arange(
                 1, L + 1, device=X.device).float().view(1, L, 1)
             cum_bp = sums[0].unsqueeze(1) + bp.cumsum(1)
             cum_var = sums[1].unsqueeze(1) + var.cumsum(1)
-            rel = bp - cum_bp / count
+            mean = cum_bp / count
+            rel = bp - mean
             scale = (cum_var / count).sqrt().clamp_min(
                 0.25 * self.chan_std.view(1, 1, C))
-            sums = (cum_bp[:, -1], cum_var[:, -1], count[:, -1])
-            bp_in = torch.cat([bp, rel], dim=-1)
+            parts_bp = [bp, rel]
+            ema = sums[3]
+            if self.n_feats >= 2:
+                emas = []
+                for i in range(L):
+                    ema = (bp[:, i] if ema is None
+                           else ema + self.ema_alpha * (bp[:, i] - ema))
+                    emas.append(ema)
+                emas = torch.stack(emas, dim=1)
+                parts_bp += [bp - emas, emas - mean]
+            sums = (cum_bp[:, -1], cum_var[:, -1], count[:, -1], ema)
+            bp_in = torch.cat(parts_bp, dim=-1)
         else:
             scale = self.chan_std.view(1, 1, C).expand(B, L, C)
             bp_in = bp
-        h = self.cnn(Xf / scale.reshape(B * L, C, 1))
-        cnn = torch.cat([h.mean(-1), h.std(-1)], dim=1).reshape(B, L, -1)
+        parts = []
+        if self.use_cnn:
+            h = self.cnn(Xf / scale.reshape(B * L, C, 1))
+            parts.append(torch.cat([h.mean(-1), h.std(-1)], dim=1
+                                   ).reshape(B, L, -1))
 
         idx = torch.arange(L, device=X.device).float().unsqueeze(0)
         idx = idx + torch.as_tensor(start_index, device=X.device,
                                     dtype=torch.float32).reshape(-1, 1)
         t = torch.log1p(idx.expand(B, L) * self.window_s / 60.0).unsqueeze(-1)
-        z = self.in_proj(torch.cat([cnn, self.bp_proj(bp_in), t], dim=-1))
+        z = self.in_proj(torch.cat(parts + [self.bp_proj(bp_in), t], dim=-1))
         return z, sums
 
     def forward(self, X, start_index=0, state=None):
@@ -212,10 +277,10 @@ class SleepOnsetEnsemble(nn.Module):
     """Averages the members' time-to-N2 distributions; predicts a quantile."""
 
     def __init__(self, n_chans, n_times, sfreq, n_members=N_SEEDS,
-                 adapt=ADAPT):
+                 adapt=ADAPT, use_cnn=USE_CNN, feats=FEATS):
         super().__init__()
         self.members = nn.ModuleList(
-            SleepOnsetCNNGRU(n_chans, n_times, sfreq, adapt)
+            SleepOnsetCNNGRU(n_chans, n_times, sfreq, adapt, use_cnn, feats)
             for _ in range(n_members))
         self.register_buffer("quantile", torch.tensor(0.5))
 
@@ -260,6 +325,41 @@ def _load_windows(dataset):
           f"{time.time() - t0:.0f} s")
     return (torch.cat(Xs), torch.cat(ys), np.concatenate(recs),
             np.concatenate(onsets), np.concatenate(subs))
+
+
+def _extra_windows(train_dataset):
+    """NeuralBench's validation split of the public Muse training release.
+
+    The harness builds NeuralBench's train/val/test loaders but hands the
+    solver only the train one; its validation split (20 % of the sleepers
+    without a test recording, fixed by ``valid_random_state``) is public
+    training data too, so it is loaded here, for training only. Local
+    training only: never runs on Codabench. Returns None when unavailable
+    (e.g. the Simulated dataset) or if it would overlap the train split.
+    """
+    if not hasattr(train_dataset, "seg_ds"):
+        return None
+    try:
+        from benchopt.config import get_data_path
+        from benchmark_utils.nb_task import load_task
+        t0 = time.time()
+        loaders, _ = load_task(
+            "eeg", "_sleep_onset_stream",
+            data_dir=get_data_path("neural_compet"), device="cpu",
+            batch_size=512, target_transform=lambda y: y.reshape(()))
+    except Exception as err:          # noqa: BLE001 - optional extra data
+        print(f"[CNN-GRU] extra data unavailable ({err}); skipping")
+        return None
+    val_ds = loaders["val"].dataset
+    train_tl = {seg.timeline for seg in train_dataset.seg_ds.segments}
+    val_tl = {seg.timeline for seg in val_ds.seg_ds.segments}
+    if train_tl & val_tl:
+        print(f"[CNN-GRU] extra data overlaps the train split "
+              f"({len(train_tl & val_tl)} recordings); skipping")
+        return None
+    print(f"[CNN-GRU] extra split: {len(val_tl)} recordings "
+          f"(set up in {time.time() - t0:.0f} s)")
+    return _load_windows(val_ds)
 
 
 def _recordings(y, rec, onset, sub, rng):
@@ -338,8 +438,8 @@ def _batch_tensor(X_all, recs, start, stop, device):
 
 def _detach(state):
     h, sums = state
-    return h.detach(), None if sums is None else tuple(s.detach()
-                                                       for s in sums)
+    return h.detach(), None if sums is None else tuple(
+        None if s is None else s.detach() for s in sums)
 
 
 @torch.no_grad()
@@ -447,6 +547,41 @@ def _train_member(model, seed, X_all, y_all, train_recs, val_recs, weights,
     return best
 
 
+def _subsample_subjects(recs, frac):
+    """Keep the recordings of a random ``frac`` of their subjects."""
+    if frac >= 1.0:
+        return recs
+    subjects = np.unique([s for _, s in recs])
+    rng = np.random.default_rng(12345)
+    keep = set(rng.choice(subjects, max(1, int(round(frac * len(subjects)))),
+                          replace=False))
+    return [r for r in recs if r[1] in keep]
+
+
+def _save_val_predictions(val_recs, rec, sub, y_all, preds):
+    """Validation-sleeper predictions -> build/<label>_valpred.npz.
+
+    Training-time analysis only (blend, error per range); written next to
+    the exported folder, not inside it, so it never ships in the ZIP.
+    """
+    sub_dir = os.environ.get("COMPET_SUBMISSION_DIR")
+    if not sub_dir:
+        return
+    sub_dir = os.path.abspath(sub_dir)
+    out = os.path.join(os.path.dirname(sub_dir),
+                       os.path.basename(sub_dir) + "_valpred.npz")
+    idx = np.concatenate([i for i, _ in val_recs])
+    # ``record`` = index of the validation recording (identical order in
+    # cnn_gru.py and gbm.py), ``record_id`` = the dataset's own id.
+    np.savez(out, record=np.concatenate([np.full(len(i), k) for k, (i, _)
+                                         in enumerate(val_recs)]),
+             record_id=np.asarray(rec[idx]).astype(str),
+             subject=np.asarray(sub[idx]).astype(str),
+             position=np.concatenate([np.arange(len(i)) for i, _ in val_recs]),
+             y=y_all[idx].numpy(), pred=np.concatenate(preds))
+    print(f"[CNN-GRU] validation predictions -> {out}")
+
+
 class Solver(CompetSolver):
 
     name = "CNN-GRU-Hazard"
@@ -463,10 +598,18 @@ class Solver(CompetSolver):
             n_members = len({k.split(".")[1] for k in state
                              if k.startswith("members.")})
             adapt = bool(state["members.0.adapt"])
+            # Older checkpoints predate the switch and always had the CNN.
+            # Older checkpoints predate these switches: CNN on, feats 1.
+            use_cnn = bool(state.get("members.0.cnn_on", True))
+            feats = int(state.get("members.0.feats", 1))
+            for i in range(n_members):
+                state.setdefault(f"members.{i}.cnn_on", torch.tensor(True))
+                state.setdefault(f"members.{i}.feats", torch.tensor(1))
         else:
-            n_members, adapt = N_SEEDS, ADAPT
+            n_members, adapt, use_cnn, feats = N_SEEDS, ADAPT, USE_CNN, FEATS
         model = SleepOnsetEnsemble(meta["n_chans"], meta["n_times"],
-                                   float(meta["sfreq"]), n_members, adapt)
+                                   float(meta["sfreq"]), n_members, adapt,
+                                   use_cnn, feats)
         if state is not None:
             model.load_state_dict(state)
         return model.to(meta["device"]).eval()
@@ -482,10 +625,33 @@ class Solver(CompetSolver):
         val_subjects = set(rng.choice(subjects, n_val, replace=False))
         train_recs = [r for r in recs if r[1] not in val_subjects]
         val_recs = [r for r in recs if r[1] in val_subjects]
+        train_recs = _subsample_subjects(train_recs, TRAIN_FRAC)
+
+        # Extra training-only recordings; the validation sleepers above are
+        # drawn before they are added, so validation stays comparable.
+        extra = _extra_windows(train_loader.dataset) if EXTRA_DATA else None
+        if extra is not None:
+            n0, rec_off = len(y_all), int(rec.max()) + 1
+            sub_off = int(np.max(sub)) + 1
+            X_e, y_e, rec_e, onset_e, sub_e = extra
+            extra_recs = [(idx + n0, s + sub_off) for idx, s in
+                          _recordings(y_e, rec_e, onset_e, sub_e, rng)]
+            X_all = torch.cat([X_all, X_e])
+            y_all = torch.cat([y_all, y_e])
+            rec = np.concatenate([rec, rec_e + rec_off])
+            onset = np.concatenate([onset, onset_e])
+            sub = np.concatenate([sub, sub_e + sub_off])
+            train_recs = train_recs + extra_recs
+            recs = recs + extra_recs
+            print(f"[CNN-GRU] + {len(extra_recs)} extra training recordings")
+
         print(f"[CNN-GRU] {len(train_recs)} train / {len(val_recs)} val "
               f"recordings ({len(subjects)} subjects); "
               f"{len(model.members)} members, "
-              f"adapt={model.members[0].use_adapt}")
+              f"adapt={model.members[0].use_adapt}, "
+              f"cnn={model.members[0].use_cnn}, "
+              f"feats={model.members[0].n_feats}, extra={extra is not None}, "
+              f"train_frac={TRAIN_FRAC}, seed={MEMBER_SEED}")
         weights = {id(idx): _window_weights(y_all[idx].numpy())
                    for idx, _ in recs}
 
@@ -508,7 +674,8 @@ class Solver(CompetSolver):
 
         member_probas = []
         for i, member in enumerate(model.members):
-            best = _train_member(member, SEED + i, X_all, y_all, train_recs,
+            best = _train_member(member, 1000 * MEMBER_SEED + i, X_all, y_all,
+                                 train_recs,
                                  val_recs, weights, device,
                                  f"{i + 1}/{len(model.members)}")
             print(f"[CNN-GRU] member {i + 1}: best val W-bMAE {best:.1f} s")
@@ -521,6 +688,10 @@ class Solver(CompetSolver):
         model.quantile.fill_(q)
         model.to(out_device).eval()
         print(f"[CNN-GRU] ensemble val W-bMAE {score:.1f} s, q={q:.2f}")
+        _save_val_predictions(
+            val_recs, rec, sub, y_all,
+            [quantile_seconds(p, q).clamp(0, CAP_S).cpu().numpy()
+             for p in ensemble])
         self._check_streaming(model, X_all, val_recs[0][0], out_device)
 
     @staticmethod
