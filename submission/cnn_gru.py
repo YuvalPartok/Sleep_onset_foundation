@@ -20,6 +20,13 @@ sleeper's history; with ``feats=2`` also relative to a ~1 min EMA (the
 short-term change) and the EMA relative to the running mean (the trend).
 All statistics are causal, over the windows seen so far.
 
+Staging output (``SLEEP_STAGE_WEIGHT`` > 0, training only): a second head on
+the GRU predicts YASA's sleep stage of each window's 30 s epoch (wake /
+drowsy = N1 + REM / N2+), soft labels distilled from YASA run offline on the
+full recordings (scripts/yasa_check.py -> scripts/make_yasa_teacher.py ->
+data/yasa_teacher.npz). It only shapes the GRU's state during training;
+predictions come from the time-to-N2 head alone.
+
 The head outputs a distribution over the time to the first N2 epoch, in
 5 s bins (0, 5, ..., 595, 600 = capped). The ensemble averages the members'
 distributions; ``p[0]`` is the hazard (probability that N2 starts within the
@@ -77,8 +84,22 @@ EXTRA_DATA = os.environ.get("SLEEP_EXTRA_DATA", "1") == "1"
 TRAIN_FRAC = float(os.environ.get("SLEEP_TRAIN_FRAC", 1.0))
 MEMBER_SEED = int(os.environ.get("SLEEP_SEED", 0))
 EMA_S = 60.0                             # short-term EMA time constant
+# Staging output: loss weight (0 = off) and the YASA teacher labels.
+STAGE_WEIGHT = float(os.environ.get("SLEEP_STAGE_WEIGHT", 0.0))
+TEACHER_FILE = os.environ.get("SLEEP_TEACHER", os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data",
+    "yasa_teacher.npz"))
+N_STAGES = 3                             # wake, drowsy (N1 + REM), N2+
+# Cross-validated all-data training (final builds): with SLEEP_CV_FOLDS = K
+# > 0 the ensemble has K members; member k trains on every recording except
+# the sleepers of fold k, early-stops on fold k, and the quantile is chosen
+# on the out-of-fold predictions of all recordings. SLEEP_USE_TEST=1 also
+# trains on the 40 public warm-up test recordings (the warm-up is over; the
+# local test score is then meaningless).
+CV_FOLDS = int(os.environ.get("SLEEP_CV_FOLDS", 0))
+USE_TEST = os.environ.get("SLEEP_USE_TEST", "0") == "1"
 
-EPOCHS = 30
+EPOCHS = int(os.environ.get("SLEEP_EPOCHS", 30))
 PATIENCE = 8
 LR = 1e-3
 WEIGHT_DECAY = 1e-4
@@ -109,7 +130,7 @@ class SleepOnsetCNNGRU(nn.Module):
     """One member: (B, L, C, T) sequences -> logits (B, L, K) over bins."""
 
     def __init__(self, n_chans, n_times, sfreq, adapt=ADAPT, use_cnn=USE_CNN,
-                 feats=FEATS):
+                 feats=FEATS, stage=STAGE_WEIGHT > 0):
         super().__init__()
         self.n_chans, self.n_times, self.sfreq = n_chans, n_times, sfreq
         self.window_s = n_times / sfreq
@@ -162,6 +183,10 @@ class SleepOnsetCNNGRU(nn.Module):
                           dropout=DROPOUT)
         self.head = nn.Sequential(nn.Dropout(DROPOUT),
                                   nn.Linear(GRU_HIDDEN, N_BINS))
+        # Training-only auxiliary head (see module docstring).
+        self.stage_head = (nn.Sequential(nn.Dropout(DROPOUT),
+                                         nn.Linear(GRU_HIDDEN, N_STAGES))
+                           if stage else None)
         self.reset_state()
 
     def band_powers(self, X):
@@ -245,16 +270,19 @@ class SleepOnsetCNNGRU(nn.Module):
         z = self.in_proj(torch.cat(parts + [self.bp_proj(bp_in), t], dim=-1))
         return z, sums
 
-    def forward(self, X, start_index=0, state=None):
+    def forward(self, X, start_index=0, state=None, return_stage=False):
         """Sequences (B, L, C, T) of consecutive windows -> logits (B, L, K).
 
         ``start_index`` is the index of the first window in its recording
         (int or (B,) tensor) and ``state`` = (GRU state, running sums) is
-        carried from the previous chunk of the same recordings.
+        carried from the previous chunk of the same recordings. With
+        ``return_stage`` the staging logits (B, L, 3) come second.
         """
         h, sums = state if state is not None else (None, None)
         z, sums = self.encode(X, start_index, sums)
         out, h = self.gru(z, h)
+        if return_stage:
+            return self.head(out), self.stage_head(out), (h, sums)
         return self.head(out), (h, sums)
 
     # --- streamed inference ---------------------------------------------
@@ -277,10 +305,12 @@ class SleepOnsetEnsemble(nn.Module):
     """Averages the members' time-to-N2 distributions; predicts a quantile."""
 
     def __init__(self, n_chans, n_times, sfreq, n_members=N_SEEDS,
-                 adapt=ADAPT, use_cnn=USE_CNN, feats=FEATS):
+                 adapt=ADAPT, use_cnn=USE_CNN, feats=FEATS,
+                 stage=STAGE_WEIGHT > 0):
         super().__init__()
         self.members = nn.ModuleList(
-            SleepOnsetCNNGRU(n_chans, n_times, sfreq, adapt, use_cnn, feats)
+            SleepOnsetCNNGRU(n_chans, n_times, sfreq, adapt, use_cnn, feats,
+                             stage)
             for _ in range(n_members))
         self.register_buffer("quantile", torch.tensor(0.5))
 
@@ -327,18 +357,19 @@ def _load_windows(dataset):
             np.concatenate(onsets), np.concatenate(subs))
 
 
-def _extra_windows(train_dataset):
-    """NeuralBench's validation split of the public Muse training release.
+def _load_splits(train_dataset, splits):
+    """Other splits of the public Muse release -> {split: (windows, dataset)}.
 
     The harness builds NeuralBench's train/val/test loaders but hands the
-    solver only the train one; its validation split (20 % of the sleepers
-    without a test recording, fixed by ``valid_random_state``) is public
-    training data too, so it is loaded here, for training only. Local
-    training only: never runs on Codabench. Returns None when unavailable
-    (e.g. the Simulated dataset) or if it would overlap the train split.
+    solver only the train one. Its ``val`` split (20 % of the sleepers
+    without a test recording, fixed by ``valid_random_state``) and ``test``
+    split (the 40 public warm-up test recordings) are public training data
+    too, so they are loaded here, for training only. Local training only:
+    never runs on Codabench. Returns {} when unavailable (e.g. the Simulated
+    dataset); a split that would overlap another one is skipped.
     """
-    if not hasattr(train_dataset, "seg_ds"):
-        return None
+    if not hasattr(train_dataset, "seg_ds") or not splits:
+        return {}
     try:
         from benchopt.config import get_data_path
         from benchmark_utils.nb_task import load_task
@@ -349,17 +380,67 @@ def _extra_windows(train_dataset):
             batch_size=512, target_transform=lambda y: y.reshape(()))
     except Exception as err:          # noqa: BLE001 - optional extra data
         print(f"[CNN-GRU] extra data unavailable ({err}); skipping")
+        return {}
+    seen = {seg.timeline for seg in train_dataset.seg_ds.segments}
+    out = {}
+    for split in splits:
+        ds = loaders[split].dataset
+        tl = {seg.timeline for seg in ds.seg_ds.segments}
+        if seen & tl:
+            print(f"[CNN-GRU] split {split} overlaps the data already "
+                  f"loaded ({len(seen & tl)} recordings); skipping")
+            continue
+        seen |= tl
+        print(f"[CNN-GRU] extra split {split}: {len(tl)} recordings "
+              f"(set up in {time.time() - t0:.0f} s)")
+        out[split] = (_load_windows(ds), ds)
+    return out
+
+
+def _extra_windows(train_dataset):
+    """NeuralBench's validation split -> (windows, dataset), or None."""
+    return _load_splits(train_dataset, ["val"]).get("val")
+
+
+def _timeline_fields(dataset, n):
+    """{subject, session, ...} of each of the first ``n`` windows, or None."""
+    if not hasattr(dataset, "seg_ds"):
         return None
-    val_ds = loaders["val"].dataset
-    train_tl = {seg.timeline for seg in train_dataset.seg_ds.segments}
-    val_tl = {seg.timeline for seg in val_ds.seg_ds.segments}
-    if train_tl & val_tl:
-        print(f"[CNN-GRU] extra data overlaps the train split "
-              f"({len(train_tl & val_tl)} recordings); skipping")
-        return None
-    print(f"[CNN-GRU] extra split: {len(val_tl)} recordings "
-          f"(set up in {time.time() - t0:.0f} s)")
-    return _load_windows(val_ds)
+    segs = dataset.seg_ds.segments
+    order = getattr(dataset, "index", np.arange(len(segs)))
+    return [dict(kv.split("=") for kv in
+                 segs[int(order[i])].timeline.split(":", 1)[1].split(","))
+            for i in range(n)]
+
+
+def _teacher_targets(dataset, onset):
+    """YASA stage probabilities (N, 3) of each window + a found mask (N,).
+
+    Window i of ``dataset`` starts ``onset[i]`` s into its recording (the
+    harness windows tile each recording from 0 in 5 s steps), so it lies in
+    the recording's 30 s YASA epoch ``floor(onset / 30)``. Recordings are
+    matched by subject and session, parsed from the window's timeline.
+    """
+    n = len(onset)
+    target = torch.zeros(n, N_STAGES)
+    found = torch.zeros(n, dtype=torch.bool)
+    all_fields = _timeline_fields(dataset, n)
+    if all_fields is None:
+        return target, found
+    t = np.load(TEACHER_FILE)
+    where = {k: (int(a), int(b)) for k, a, b in zip(t["keys"], t["start"],
+                                                    t["n"])}
+    proba = torch.as_tensor(t["proba"].astype(np.float32))
+    for i, fields in enumerate(all_fields):
+        key = f"{fields['subject']}/{fields['session']}"
+        if key not in where:
+            continue
+        start, count = where[key]
+        k = int(onset[i] // 30.0)
+        if k < count:
+            target[i] = proba[start + k]
+            found[i] = True
+    return target, found
 
 
 def _recordings(y, rec, onset, sub, rng):
@@ -479,7 +560,7 @@ def _train_device(default):
 
 
 def _train_member(model, seed, X_all, y_all, train_recs, val_recs, weights,
-                  device, tag):
+                  device, tag, stage_all=None):
     """Train one member in place; keep its best epoch on validation."""
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
@@ -498,20 +579,31 @@ def _train_member(model, seed, X_all, y_all, train_recs, val_recs, weights,
         batches = [order[i:i + RECS_PER_BATCH]
                    for i in range(0, len(order), RECS_PER_BATCH)]
         rng.shuffle(batches)
-        running, n_rec = 0.0, 0
+        use_stage = stage_all is not None and model.stage_head is not None
+        running, running_stage, n_rec = 0.0, 0.0, 0
         for batch in batches:
             idxs = [train_recs[i][0] for i in batch]
             max_len = max(len(idx) for idx in idxs)
             y = torch.zeros(len(idxs), max_len)
             w = torch.zeros(len(idxs), max_len)
+            st = torch.zeros(len(idxs), max_len, N_STAGES)
+            sm = torch.zeros(len(idxs), max_len)
             for b, idx in enumerate(idxs):
                 y[b, :len(idx)] = y_all[idx]
                 w[b, :len(idx)] = weights[id(idx)]
+                if use_stage:
+                    st[b, :len(idx)] = stage_all[0][idx]
+                    sm[b, :len(idx)] = stage_all[1][idx].float()
             y, w = y.to(device), w.to(device)
+            st, sm = st.to(device), sm.to(device)
             state = None
             for s in range(0, max_len, CHUNK):
                 X, mask = _batch_tensor(X_all, idxs, s, s + CHUNK, device)
-                logits, state = model(_augment(X), s, state)
+                if use_stage:
+                    logits, stage_logits, state = model(_augment(X), s, state,
+                                                        return_stage=True)
+                else:
+                    logits, state = model(_augment(X), s, state)
                 state = _detach(state)
                 yc, wc = y[:, s:s + CHUNK], w[:, s:s + CHUNK] * mask
                 logp = logits.log_softmax(-1)
@@ -519,6 +611,15 @@ def _train_member(model, seed, X_all, y_all, train_recs, val_recs, weights,
                 mean = (logp.exp() * model.bin_values).sum(-1)
                 l1 = (mean - yc.clamp(0, CAP_S)).abs() / CAP_S
                 loss = ((ce + L1_WEIGHT * l1) * wc).sum() / len(idxs)
+                if use_stage:
+                    # Distil YASA's stage, weighted like the main loss (so
+                    # near-onset windows, where N1 matters, count most).
+                    stage_ce = -(st[:, s:s + CHUNK]
+                                 * stage_logits.log_softmax(-1)).sum(-1)
+                    stage_loss = (stage_ce * wc * sm[:, s:s + CHUNK]
+                                  ).sum() / len(idxs)
+                    loss = loss + STAGE_WEIGHT * stage_loss
+                    running_stage += stage_loss.item() * len(idxs)
                 opt.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -531,8 +632,10 @@ def _train_member(model, seed, X_all, y_all, train_recs, val_recs, weights,
                   for idx, _ in val_recs]
         q, score = min(_scores(probas, y_all, val_recs).items(),
                        key=lambda kv: kv[1])
+        stage_msg = (f" (stage CE {running_stage / n_rec:.3f})"
+                     if use_stage else "")
         print(f"[CNN-GRU {tag}] epoch {epoch + 1}/{EPOCHS} "
-              f"loss {running / n_rec:.3f} val W-bMAE {score:.1f} s "
+              f"loss {running / n_rec:.3f}{stage_msg} val W-bMAE {score:.1f} s "
               f"(q={q}) {time.time() - t0:.0f} s")
         if score < best:
             best, bad = score, 0
@@ -598,26 +701,40 @@ class Solver(CompetSolver):
             n_members = len({k.split(".")[1] for k in state
                              if k.startswith("members.")})
             adapt = bool(state["members.0.adapt"])
-            # Older checkpoints predate the switch and always had the CNN.
             # Older checkpoints predate these switches: CNN on, feats 1.
             use_cnn = bool(state.get("members.0.cnn_on", True))
             feats = int(state.get("members.0.feats", 1))
             for i in range(n_members):
                 state.setdefault(f"members.{i}.cnn_on", torch.tensor(True))
                 state.setdefault(f"members.{i}.feats", torch.tensor(1))
+            # The staging head is training-only but saved with the weights.
+            stage = any(".stage_head." in k for k in state)
         else:
             n_members, adapt, use_cnn, feats = N_SEEDS, ADAPT, USE_CNN, FEATS
+            if CV_FOLDS > 0:
+                n_members = CV_FOLDS           # one member per fold
+            stage = STAGE_WEIGHT > 0
         model = SleepOnsetEnsemble(meta["n_chans"], meta["n_times"],
                                    float(meta["sfreq"]), n_members, adapt,
-                                   use_cnn, feats)
+                                   use_cnn, feats, stage)
         if state is not None:
             model.load_state_dict(state)
         return model.to(meta["device"]).eval()
 
     def fit(self, model, train_loader):
+        if CV_FOLDS > 0:
+            return self._fit_cv(model, train_loader)
         rng = np.random.default_rng(SEED)
         X_all, y_all, rec, onset, sub = _load_windows(train_loader.dataset)
         recs = _recordings(y_all, rec, onset, sub, rng)
+        use_stage = STAGE_WEIGHT > 0 and hasattr(train_loader.dataset,
+                                                 "seg_ds")
+        if STAGE_WEIGHT > 0 and not os.path.exists(TEACHER_FILE):
+            raise FileNotFoundError(
+                f"SLEEP_STAGE_WEIGHT={STAGE_WEIGHT} needs the YASA teacher "
+                f"labels at {TEACHER_FILE} (scripts/make_yasa_teacher.py)")
+        if use_stage:
+            stage_t, stage_m = _teacher_targets(train_loader.dataset, onset)
 
         # Hold out whole subjects for early stopping and the quantile.
         subjects = np.unique([s for _, s in recs])
@@ -633,7 +750,11 @@ class Solver(CompetSolver):
         if extra is not None:
             n0, rec_off = len(y_all), int(rec.max()) + 1
             sub_off = int(np.max(sub)) + 1
-            X_e, y_e, rec_e, onset_e, sub_e = extra
+            (X_e, y_e, rec_e, onset_e, sub_e), extra_ds = extra
+            if use_stage:
+                t_e, m_e = _teacher_targets(extra_ds, onset_e)
+                stage_t = torch.cat([stage_t, t_e])
+                stage_m = torch.cat([stage_m, m_e])
             extra_recs = [(idx + n0, s + sub_off) for idx, s in
                           _recordings(y_e, rec_e, onset_e, sub_e, rng)]
             X_all = torch.cat([X_all, X_e])
@@ -651,7 +772,15 @@ class Solver(CompetSolver):
               f"adapt={model.members[0].use_adapt}, "
               f"cnn={model.members[0].use_cnn}, "
               f"feats={model.members[0].n_feats}, extra={extra is not None}, "
-              f"train_frac={TRAIN_FRAC}, seed={MEMBER_SEED}")
+              f"train_frac={TRAIN_FRAC}, seed={MEMBER_SEED}, "
+              f"stage_weight={STAGE_WEIGHT if use_stage else 0}")
+        if use_stage:
+            train_idx = np.concatenate([idx for idx, _ in train_recs])
+            m = stage_m[train_idx]
+            mean_t = stage_t[train_idx][m].mean(0).tolist()
+            print(f"[CNN-GRU] YASA labels for {m.float().mean():.1%} of "
+                  f"training windows; mean wake/drowsy/N2+ = "
+                  + "/".join(f"{v:.2f}" for v in mean_t))
         weights = {id(idx): _window_weights(y_all[idx].numpy())
                    for idx, _ in recs}
 
@@ -677,7 +806,8 @@ class Solver(CompetSolver):
             best = _train_member(member, 1000 * MEMBER_SEED + i, X_all, y_all,
                                  train_recs,
                                  val_recs, weights, device,
-                                 f"{i + 1}/{len(model.members)}")
+                                 f"{i + 1}/{len(model.members)}",
+                                 (stage_t, stage_m) if use_stage else None)
             print(f"[CNN-GRU] member {i + 1}: best val W-bMAE {best:.1f} s")
             member_probas.append([_sequence_proba(member, X_all, idx, device)
                                   for idx, _ in val_recs])
@@ -693,6 +823,142 @@ class Solver(CompetSolver):
             [quantile_seconds(p, q).clamp(0, CAP_S).cpu().numpy()
              for p in ensemble])
         self._check_streaming(model, X_all, val_recs[0][0], out_device)
+
+    def _fit_cv(self, model, train_loader):
+        """Cross-validated all-data training (see CV_FOLDS)."""
+        rng = np.random.default_rng(SEED)
+        train_ds = train_loader.dataset
+        X_all, y_all, rec, onset, sub = _load_windows(train_ds)
+        n_train = len(y_all)
+
+        # The usual validation recordings (drawn exactly as in ``fit``), only
+        # to report a score comparable with the experiments' val W-bMAE.
+        base_recs = _recordings(y_all, rec, onset, sub, rng)
+        subjects = np.unique([s for _, s in base_recs])
+        n_val = max(1, int(round(VAL_FRACTION * len(subjects))))
+        classic_val = set(rng.choice(subjects, n_val, replace=False))
+        classic_rec = {int(rec[idx[0]]) for idx, s in base_recs
+                       if s in classic_val}
+
+        # Sleeper of every window, by name, so a sleeper's recordings from
+        # different splits land in the same fold.
+        fields = _timeline_fields(train_ds, n_train)
+        names = (np.array([f["subject"] for f in fields]) if fields
+                 else np.asarray(sub).astype(str))
+        use_stage = STAGE_WEIGHT > 0 and fields is not None
+        if STAGE_WEIGHT > 0 and not os.path.exists(TEACHER_FILE):
+            raise FileNotFoundError(
+                f"SLEEP_STAGE_WEIGHT={STAGE_WEIGHT} needs the YASA teacher "
+                f"labels at {TEACHER_FILE} (scripts/make_yasa_teacher.py)")
+        if use_stage:
+            stage_t, stage_m = _teacher_targets(train_ds, onset)
+
+        split_of = np.zeros(n_train, dtype=object)
+        split_of[:] = "train"
+        wanted = (["val"] if EXTRA_DATA else []) + (["test"] if USE_TEST
+                                                     else [])
+        for split, ((X_e, y_e, rec_e, onset_e, _), ds) in _load_splits(
+                train_ds, wanted).items():
+            f_e = _timeline_fields(ds, len(y_e))
+            rec_off = int(rec.max()) + 1
+            X_all = torch.cat([X_all, X_e])
+            y_all = torch.cat([y_all, y_e])
+            rec = np.concatenate([rec, rec_e + rec_off])
+            onset = np.concatenate([onset, onset_e])
+            names = np.concatenate([names, [f["subject"] for f in f_e]])
+            split_of = np.concatenate([split_of, np.full(len(y_e), split,
+                                                         dtype=object)])
+            if use_stage:
+                t_e, m_e = _teacher_targets(ds, onset_e)
+                stage_t = torch.cat([stage_t, t_e])
+                stage_m = torch.cat([stage_m, m_e])
+
+        _, sub_int = np.unique(names, return_inverse=True)
+        recs = _recordings(y_all, rec, onset, sub_int, rng)
+        rec_split = [split_of[idx[0]] for idx, _ in recs]
+        is_classic = [split_of[idx[0]] == "train"
+                      and int(rec[idx[0]]) in classic_rec for idx, _ in recs]
+
+        # Folds over sleepers.
+        fold_subjects = np.random.default_rng(SEED + 1).permutation(
+            np.unique([s for _, s in recs]))
+        K = len(model.members)
+        fold_of = {s: k for k, part in enumerate(np.array_split(
+            fold_subjects, K)) for s in part}
+        rec_fold = np.array([fold_of[s] for _, s in recs])
+        counts = {sp: rec_split.count(sp) for sp in ("train", "val", "test")}
+        print(f"[CNN-GRU] CV: {len(recs)} recordings "
+              f"({counts['train']} train + {counts['val']} extra + "
+              f"{counts['test']} warm-up test) from {len(fold_subjects)} "
+              f"sleepers, {K} folds of "
+              f"{'/'.join(str((rec_fold == k).sum()) for k in range(K))} "
+              f"recordings; cnn={model.members[0].use_cnn}, "
+              f"feats={model.members[0].n_feats}, "
+              f"stage_weight={STAGE_WEIGHT if use_stage else 0}")
+        if counts["test"]:
+            print("[CNN-GRU] note: the warm-up test recordings are in "
+                  "training, so this build's test W-bMAE is meaningless")
+        weights = {id(idx): _window_weights(y_all[idx].numpy())
+                   for idx, _ in recs}
+
+        # Normalisation stats from all windows, shared by members.
+        sample = X_all[rng.choice(len(y_all), min(20000, len(y_all)),
+                                  replace=False)].float()
+        chan_std = sample.std(dim=(0, 2)).clamp_min(1e-3)
+        first = model.members[0]
+        feats = first.band_powers(sample.to(first.chan_std.device))
+        for m in model.members:
+            m.chan_std.copy_(chan_std)
+            m.bp_mean.copy_(feats.mean(0))
+            m.bp_std.copy_(feats.std(0).clamp_min(1e-3))
+
+        out_device = model.quantile.device
+        device = _train_device(str(out_device))
+        model.to(device)
+        print(f"[CNN-GRU] training on {device}")
+
+        oof = [None] * len(recs)
+        for k, member in enumerate(model.members):
+            tr = [r for r, f in zip(recs, rec_fold) if f != k]
+            va_i = [i for i, f in enumerate(rec_fold) if f == k]
+            va = [recs[i] for i in va_i]
+            best = _train_member(member, 1000 * MEMBER_SEED + k, X_all, y_all,
+                                 tr, va, weights, device,
+                                 f"fold {k + 1}/{K}",
+                                 (stage_t, stage_m) if use_stage else None)
+            print(f"[CNN-GRU] fold {k + 1}: {len(tr)} train / {len(va)} "
+                  f"held-out recordings, best held-out W-bMAE {best:.1f} s")
+            for i in va_i:
+                oof[i] = _sequence_proba(member, X_all, recs[i][0], device)
+
+        all_scores = _scores(oof, y_all, recs)
+        q, score = min(all_scores.items(), key=lambda kv: kv[1])
+        model.quantile.fill_(q)
+        model.to(out_device).eval()
+
+        def subset(mask):
+            pairs = [(p, r) for p, r, m in zip(oof, recs, mask) if m]
+            if not pairs:
+                return float("nan")
+            return _scores([p for p, _ in pairs], y_all,
+                           [r for _, r in pairs])[q]
+
+        msg = (f"out-of-fold W-bMAE {score:.1f} s on all {len(recs)} "
+               f"recordings, q={q:.2f}")
+        if counts["test"]:
+            msg += (f"; warm-up test recordings "
+                    f"{subset([sp == 'test' for sp in rec_split]):.1f} s")
+        print(f"[CNN-GRU] {msg}")
+        # Comparable with the experiments' val W-bMAE (same 60 recordings,
+        # each predicted by the member that did not train on its sleeper).
+        print(f"[CNN-GRU] ensemble val W-bMAE {subset(is_classic):.1f} s "
+              f"(out-of-fold, the usual validation recordings)")
+        classic = [r for r, m in zip(recs, is_classic) if m]
+        _save_val_predictions(
+            classic, rec, sub_int, y_all,
+            [quantile_seconds(p, q).clamp(0, CAP_S).cpu().numpy()
+             for p, m in zip(oof, is_classic) if m])
+        self._check_streaming(model, X_all, recs[0][0], out_device)
 
     @staticmethod
     @torch.no_grad()

@@ -11,6 +11,7 @@ Usage:
     python scripts/make_colab_notebook.py
 """
 
+import base64
 import json
 import subprocess
 from pathlib import Path
@@ -20,6 +21,9 @@ OUT = ROOT / "colab" / "train_on_colab.ipynb"
 EMBEDDED = sorted((ROOT / "submission").glob("*.py")) + [
     ROOT / "scripts" / "build_submission.py"]
 REPO = "https://github.com/neural-interfaces26/2026-competition.git"
+# YASA teacher labels (scripts/yasa_check.py -> scripts/make_yasa_teacher.py),
+# embedded so Colab never has to install or run YASA.
+TEACHER = ROOT / "data" / "yasa_teacher.npz"
 
 
 def md(text):
@@ -105,6 +109,28 @@ for sub in ("submission", "scripts", "build", "dist"):
         rel = path.relative_to(ROOT).as_posix()
         cells.append(code(f"%%writefile /content/EEG_sleep_foundation/{rel}\n"
                           + path.read_text()))
+    if TEACHER.exists():
+        b64 = base64.b64encode(TEACHER.read_bytes()).decode()
+        lines = "\n".join(b64[i:i + 100] for i in range(0, len(b64), 100))
+        cells += [
+            md("""
+YASA teacher labels for the staging output: YASA's wake / drowsy / N2+
+probabilities per 30 s epoch of every Muse recording, computed offline
+(`scripts/yasa_check.py`, `scripts/make_yasa_teacher.py`). Embedded here, so
+YASA is never installed on Colab.
+"""),
+            code(f'''
+import base64
+from pathlib import Path
+TEACHER_B64 = """
+{lines}
+"""
+teacher = Path("/content/EEG_sleep_foundation/data/yasa_teacher.npz")
+teacher.parent.mkdir(parents=True, exist_ok=True)
+teacher.write_bytes(base64.b64decode("".join(TEACHER_B64.split())))
+print(f"wrote {{teacher}} ({{teacher.stat().st_size / 1024:.0f}} KB)")
+'''),
+        ]
     cells += [
         md("## Install dependencies (keeps Colab's CUDA torch)"),
         code("""
@@ -164,8 +190,23 @@ Every run is scored two ways:
 * **test W-bMAE**: the 40 warm-up recordings (sleepers **seen** in training),
   scored inference-only as on Codabench.
 
-**Round 2** (default, `ROUND = 2`) tests the three changes made after round 1,
-all on the GRU without the CNN, 3 seeds each:
+**Round 3** (default, `ROUND = 3`) tests the staging output distilled from
+YASA, on top of round 2's best setup (`r2_feats_extra`: no CNN, drowsiness
+features, extra recordings), 3 seeds each:
+
+| Run | Staging loss weight |
+|---|---|
+| `r3_base` | 0 (off; = `r2_feats_extra`) |
+| `r3_stage05` | 0.5 |
+| `r3_stage1` | 1.0 |
+
+The staging output predicts YASA's wake / drowsy (N1 + REM) / N2+
+probabilities for each window. It is used only in training, to shape what
+the GRU tracks; predictions still come from the time-to-N2 output alone, and
+the submission format is unchanged. The log's `stage CE` is its loss.
+
+**Round 2** (`ROUND = 2`) tested the three changes made after round 1, all on
+the GRU without the CNN, 3 seeds each:
 
 | Run | Extra recordings | Drowsiness and trend features |
 |---|---|---|
@@ -185,8 +226,15 @@ all on the GRU without the CNN, 3 seeds each:
 GBM). Finished runs are saved in Drive and skipped on a re-run, so after a
 disconnect just **Run all** again.
 
-`RUN_PRODUCTION = True` also builds the 5-member submission with the settings
-in `PRODUCTION_ENV` (the defaults = no CNN, new features, extra recordings).
+`RUN_PRODUCTION = True` also builds the submission for the sealed phase with
+the settings in `PRODUCTION_ENV`: a **cross-validated ensemble trained on all
+540 public recordings** (the harness's training set, the 88 extra recordings
+and the 40 warm-up test recordings). Each of its 5 models holds out a
+different fifth of the sleepers for early stopping, so together they train on
+everything. Its `val` in the summary is out-of-fold on the usual 60
+validation recordings (each predicted by the model that never saw that
+sleeper), so it stays roughly comparable with the experiments. Its `test` is
+meaningless, since the warm-up test recordings are in its training data.
 To build only the submission, also set `RUN_EXPERIMENTS = False`. Finished
 experiments are restored from Drive anyway, but without Drive they would
 retrain.
@@ -194,12 +242,16 @@ retrain.
         code("""
 import os, shutil
 
-ROUND = 2
+ROUND = 3
 SEEDS = [0, 1, 2]
 RUN_EXPERIMENTS = True      # the experiment runs of ROUND (False: skip them)
-RUN_PRODUCTION = False      # build the 5-member submission ensemble
-PRODUCTION_LABEL = "gru_ens5"
-PRODUCTION_ENV = {"SLEEP_N_SEEDS": "5"}   # defaults: no CNN, feats 2, extra data
+RUN_PRODUCTION = False      # build the sealed-phase submission
+PRODUCTION_LABEL = "gru_cv5_all"
+# 5-fold cross-validated ensemble on all 540 public recordings; solver
+# defaults: no CNN, feats 2, extra data, no staging output. If round 3's
+# staging output wins, add e.g. "SLEEP_STAGE_WEIGHT": "0.5" (and change the
+# label, so Drive does not restore the earlier build).
+PRODUCTION_ENV = {"SLEEP_CV_FOLDS": "5", "SLEEP_USE_TEST": "1"}
 
 GBM, CNN = "submission/gbm.py", "submission/cnn_gru.py"
 # Round 1 settings spelled out, since the solver defaults changed after it.
@@ -222,6 +274,11 @@ EXPERIMENTS = {
         ("r2_extra",         CNN, {**GRU, "SLEEP_FEATS": "1", "SLEEP_EXTRA_DATA": "1"}),
         ("r2_feats",         CNN, {**GRU, "SLEEP_FEATS": "2", "SLEEP_EXTRA_DATA": "0"}),
         ("r2_feats_extra",   CNN, {**GRU, "SLEEP_FEATS": "2", "SLEEP_EXTRA_DATA": "1"}),
+    ],
+    3: [
+        ("r3_base",          CNN, {**GRU, "SLEEP_STAGE_WEIGHT": "0"}),
+        ("r3_stage05",       CNN, {**GRU, "SLEEP_STAGE_WEIGHT": "0.5"}),
+        ("r3_stage1",        CNN, {**GRU, "SLEEP_STAGE_WEIGHT": "1.0"}),
     ],
 }[ROUND]
 RUNS = [(f"{name}_s{seed}", solver, {**env, "SLEEP_SEED": str(seed)})
@@ -325,9 +382,11 @@ for label, _, _ in RUNS:
     d = pd.read_parquet(eval_file).filter(like="objective_").iloc[-1]
     log = (BUILD / f"{label}.log").read_text() if (BUILD / f"{label}.log").exists() else ""
     val = re.findall(r"ensemble val W-bMAE ([\\d.]+)", log)
+    trained_on_test = "test W-bMAE is meaningless" in log
     rows.append({"experiment": experiment(label), "label": label,
                  "val": float(val[-1]) if val else np.nan,
-                 "test": d["objective_wbmae_recording_mean"],
+                 # A build trained on the warm-up test recordings has no test score.
+                 "test": np.nan if trained_on_test else d["objective_wbmae_recording_mean"],
                  "test bMAE": d["objective_bmae"], "test MAE": d["objective_mae"]})
 runs = pd.DataFrame(rows, columns=["experiment", "label", "val", "test",
                                    "test bMAE", "test MAE"])
@@ -480,6 +539,18 @@ blends.round(1)
 """),
         md("""
 ## 5. Decide
+
+**Round 3.** Compare `r3_stage05` and `r3_stage1` with `r3_base`, the same
+way: validation first, then test, and only differences larger than about the
+seeds' std count. The staging output targets the last 90 s, so look first at
+the **0–40 s and 40–90 s shares** in the error table and at the **timing
+table**: predictions for 40–60 s and 60–90 s should move up from the 30–40 s
+they sat at in round 2.
+
+* **A staging run wins:** add its weight to `PRODUCTION_ENV`, e.g.
+  `"SLEEP_STAGE_WEIGHT": "0.5"`, and build the submission.
+* **Neither beats `r3_base`:** YASA's labels add nothing the model didn't
+  already have. Build without them; ANPHY's expert labels are the next try.
 
 **Round 2.** Compare each run with `r2_base`, using validation first (the
 unseen sleepers, 60 recordings) and test second. A change counts only if it
