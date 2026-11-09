@@ -6,7 +6,10 @@ Each 5 s window is summarised by hand-crafted spectral features:
   relative, and the theta/alpha ratio: the classic sleep-scoring markers;
 - with ``feats=2`` (default) also drowsiness markers: slow (< 0.6 Hz) power
   per channel and on the AF7-AF8 derivation (slow eye movements), 0.6-4 Hz
-  power on AF7-AF8, spectral entropy and 95 % spectral edge per channel.
+  power on AF7-AF8, spectral entropy and 95 % spectral edge per channel;
+- with ``feats=3`` also movement / arousal markers: fraction of clipped
+  samples, log peak amplitude and log line length (movements and arousals
+  pull a drowsy sleeper back to wake).
 Optionally (``use_cnn``, off by default since the bottleneck experiments
 showed it does not help with this much data) a 1-D CNN on the raw signal
 adds learned waveform features.
@@ -17,8 +20,23 @@ window per ``predict`` call, ``reset_state`` per recording).
 Per-sleeper adaptation (``adapt``): the features are also given relative to
 the recording's running mean, so each window is judged against the same
 sleeper's history; with ``feats=2`` also relative to a ~1 min EMA (the
-short-term change) and the EMA relative to the running mean (the trend).
+short-term change) and the EMA relative to the running mean (the trend);
+with ``feats=3`` also a decaying peak of each movement marker's deviation
+from the running mean over ~1 and ~5 min, so a recent movement stays
+visible for a few minutes.
 All statistics are causal, over the windows seen so far.
+
+Preprocessing v2 (``SLEEP_PREP=2``): the band powers skip 48-52 Hz (the
+recordings carry 50 Hz mains noise, which otherwise leaks into the 30-60 Hz
+band and every relative power) and use a Welch estimate (2 s Hann segments,
+1 s hop) instead of one 5 s periodogram, for less variance.
+
+Autoencoder features (``SLEEP_AE``): a denoising MLP autoencoder is first
+trained, without labels, on the training windows' log spectra (32
+log-spaced bins, 0.4-47 Hz, on the 4 channels and AF7-AF8); its frozen
+encoder's 32-dim code replaces the hand-crafted features (``ae=1``) or is
+added to them (``ae=2``). The per-recording adaptation applies to it as to
+the hand-crafted features. Only the encoder ships with the weights.
 
 Staging output (``SLEEP_STAGE_WEIGHT`` > 0, training only): a second head on
 the GRU predicts YASA's sleep stage of each window's 30 s epoch (wake /
@@ -84,8 +102,16 @@ EXTRA_DATA = os.environ.get("SLEEP_EXTRA_DATA", "1") == "1"
 TRAIN_FRAC = float(os.environ.get("SLEEP_TRAIN_FRAC", 1.0))
 MEMBER_SEED = int(os.environ.get("SLEEP_SEED", 0))
 EMA_S = 60.0                             # short-term EMA time constant
+N_MOVE = 3                               # movement markers (feats >= 3)
+PEAK_S = (60.0, 300.0)                   # decaying-peak horizons (feats >= 3)
 # Staging output: loss weight (0 = off) and the YASA teacher labels.
 STAGE_WEIGHT = float(os.environ.get("SLEEP_STAGE_WEIGHT", 0.0))
+PREP = int(os.environ.get("SLEEP_PREP", 1))     # 2: notch + Welch
+AE_MODE = int(os.environ.get("SLEEP_AE", 0))     # 1 replace, 2 add
+AE_DIM = 32                              # autoencoder code size
+AE_HIDDEN = 128
+AE_EPOCHS = int(os.environ.get("SLEEP_AE_EPOCHS", 20))
+LINE_HZ = (48.0, 52.0)                   # mains band skipped with PREP >= 2
 TEACHER_FILE = os.environ.get("SLEEP_TEACHER", os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data",
     "yasa_teacher.npz"))
@@ -130,8 +156,11 @@ class SleepOnsetCNNGRU(nn.Module):
     """One member: (B, L, C, T) sequences -> logits (B, L, K) over bins."""
 
     def __init__(self, n_chans, n_times, sfreq, adapt=ADAPT, use_cnn=USE_CNN,
-                 feats=FEATS, stage=STAGE_WEIGHT > 0):
+                 feats=FEATS, stage=STAGE_WEIGHT > 0, prep=PREP, ae=AE_MODE):
         super().__init__()
+        self.prep, self.ae = int(prep), int(ae)
+        self.register_buffer("prep_v", torch.tensor(self.prep))
+        self.register_buffer("ae_mode", torch.tensor(self.ae))
         self.n_chans, self.n_times, self.sfreq = n_chans, n_times, sfreq
         self.window_s = n_times / sfreq
         self.use_adapt = bool(adapt)
@@ -148,9 +177,21 @@ class SleepOnsetCNNGRU(nn.Module):
         # Band masks over the rFFT bins, from the actual sampling rate.
         freqs = torch.fft.rfftfreq(n_times, d=1.0 / sfreq)
         nyq = sfreq / 2
-        masks = torch.stack([((freqs >= lo) & (freqs < min(hi, nyq))).float()
-                             for lo, hi in BANDS])
+        # Band powers: one 5 s periodogram (prep 1) or Welch over 2 s Hann
+        # segments with a 1 s hop, skipping the mains band (prep 2).
+        self.seg = int(round(2 * sfreq)) if self.prep >= 2 else n_times
+        self.hop = int(round(sfreq))
+        if self.seg > n_times:
+            self.seg = n_times
+        bfreqs = torch.fft.rfftfreq(self.seg, d=1.0 / sfreq)
+        keep = torch.ones_like(bfreqs, dtype=torch.bool)
+        if self.prep >= 2:
+            keep = (bfreqs < LINE_HZ[0]) | (bfreqs > LINE_HZ[1])
+        masks = torch.stack([((bfreqs >= lo) & (bfreqs < min(hi, nyq))
+                              & keep).float() for lo, hi in BANDS])
         self.register_buffer("band_masks", masks, persistent=False)
+        self.register_buffer("seg_hann", torch.hann_window(self.seg),
+                             persistent=False)
         self.register_buffer("hann", torch.hann_window(n_times),
                              persistent=False)
         self.register_buffer("freqs", freqs, persistent=False)
@@ -161,6 +202,24 @@ class SleepOnsetCNNGRU(nn.Module):
         self.register_buffer("broad_mask", ((freqs >= 0.5)
                                             & (freqs < min(30.0, nyq))),
                              persistent=False)
+        if self.ae:
+            # Log-spaced spectrum bins, at least 0.4 Hz wide, up to 47 Hz.
+            edges, e = [0.4], 0.4
+            while e < 47.0:
+                e = min(47.0, max(e * 1.15, e + 0.4))
+                edges.append(e)
+            bins = torch.stack([((freqs >= lo) & (freqs < hi)).float()
+                                for lo, hi in zip(edges[:-1], edges[1:])], 1)
+            self.register_buffer("ae_bins", bins / bins.sum(0).clamp_min(1),
+                                 persistent=False)
+            ae_in = (n_chans + 1) * bins.shape[1]
+            self.register_buffer("spec_mean", torch.zeros(ae_in))
+            self.register_buffer("spec_std", torch.ones(ae_in))
+            self.ae_enc = nn.Sequential(nn.Linear(ae_in, AE_HIDDEN), nn.GELU(),
+                                        nn.Linear(AE_HIDDEN, AE_DIM))
+            self.ae_enc.requires_grad_(False)   # trained beforehand, frozen
+        else:
+            self.ae_enc = None
         n_bp = self.band_powers(torch.zeros(1, n_chans, n_times)).shape[1]
         self.register_buffer("bp_mean", torch.zeros(n_bp))
         self.register_buffer("bp_std", torch.ones(n_bp))
@@ -172,8 +231,14 @@ class SleepOnsetCNNGRU(nn.Module):
                        nn.BatchNorm1d(out_ch), nn.GELU(), nn.MaxPool1d(2)]
             in_ch = out_ch
         self.cnn = nn.Sequential(*layers) if self.use_cnn else None
-        bp_in = n_bp * ((4 if self.n_feats >= 2 else 2) if self.use_adapt
+        self.use_ema = self.n_feats >= 2 or self.ae > 0
+        self.use_peaks = self.n_feats >= 3 and self.ae != 1
+        bp_in = n_bp * ((4 if self.use_ema else 2) if self.use_adapt
                         else 1)
+        if self.use_adapt and self.use_peaks:
+            bp_in += N_MOVE * len(PEAK_S)
+        # Decaying peaks lose 1 normalised unit per PEAK_S seconds.
+        self.peak_decay = tuple(self.window_s / h for h in PEAK_S)
         self.bp_proj = nn.Sequential(nn.Linear(bp_in, BP_DIM), nn.GELU())
         cnn_dim = 2 * CNN_CHANNELS[-1] if self.use_cnn else 0
         self.in_proj = nn.Sequential(
@@ -189,10 +254,34 @@ class SleepOnsetCNNGRU(nn.Module):
                            if stage else None)
         self.reset_state()
 
-    def band_powers(self, X):
-        """Preprocessed (N, C, T) -> raw log band-power features (N, F)."""
+    def ae_input(self, X):
+        """Preprocessed (N, C, T) -> log binned spectra (N, (C + 1) * nb)."""
+        a, b = (1, 2) if X.shape[1] >= 3 else (0, X.shape[1] - 1)
+        X = torch.cat([X, (X[:, a] - X[:, b]).unsqueeze(1)], dim=1)
         spec = torch.fft.rfft(X * self.hann, dim=-1).abs() ** 2
-        power = torch.einsum("nct,bt->ncb", spec, self.band_masks)
+        return torch.log(spec @ self.ae_bins + 1e-6).flatten(1)
+
+    def band_powers(self, X):
+        """Preprocessed (N, C, T) -> raw features (N, F): the autoencoder
+        code and/or the hand-crafted features."""
+        if not self.ae:
+            return self.hand_features(X)
+        code = self.ae_enc((self.ae_input(X) - self.spec_mean)
+                           / self.spec_std)
+        if self.ae == 1:
+            return code
+        return torch.cat([code, self.hand_features(X)], dim=1)
+
+    def hand_features(self, X):
+        """Preprocessed (N, C, T) -> hand-crafted log band-power features."""
+        spec = torch.fft.rfft(X * self.hann, dim=-1).abs() ** 2
+        if self.seg < X.shape[-1]:
+            segs = X.unfold(-1, self.seg, self.hop)
+            bspec = (torch.fft.rfft(segs * self.seg_hann, dim=-1).abs() ** 2
+                     ).mean(-2)
+        else:
+            bspec = spec
+        power = torch.einsum("nct,bt->ncb", bspec, self.band_masks)
         log_abs = torch.log(power + 1e-6)
         log_rel = torch.log(power / (power.sum(-1, keepdim=True) + 1e-6)
                             + 1e-6)
@@ -215,6 +304,15 @@ class SleepOnsetCNNGRU(nn.Module):
                        / np.log(p.shape[-1]))
             edge = (p.cumsum(-1) >= 0.95).float().argmax(-1)
             out.append(self.freqs[self.broad_mask][edge] / 30.0)
+        if self.n_feats >= 3:
+            # Movement / arousal markers; the last N_MOVE features. X is
+            # already clipped at CLIP_UV, so "clipped" = at that limit.
+            a = X.abs()
+            out.append(torch.stack([
+                (a >= 0.99 * CLIP_UV).float().mean((1, 2)),
+                torch.log(a.amax((1, 2)) + 1e-3),
+                torch.log((X[..., 1:] - X[..., :-1]).abs().sum(-1).mean(-1)
+                          + 1e-3)], dim=1))
         return torch.cat(out, dim=1)
 
     def encode(self, X, start_index, sums):
@@ -222,8 +320,8 @@ class SleepOnsetCNNGRU(nn.Module):
 
         ``sums`` = (sum of band powers (B, F), sum of channel variances
         (B, C), window count (B, 1), short-term EMA of the band powers
-        (B, F)) over the earlier windows of each recording, or None at its
-        start.
+        (B, F), decaying movement peaks (list of (B, N_MOVE) or None)) over
+        the earlier windows of each recording, or None at its start.
         """
         B, L, C, T = X.shape
         Xf = preprocess(X.reshape(B * L, C, T))
@@ -233,7 +331,7 @@ class SleepOnsetCNNGRU(nn.Module):
             var = Xf.var(-1).reshape(B, L, C)
             if sums is None:
                 sums = (bp.new_zeros(B, bp.shape[-1]), var.new_zeros(B, C),
-                        var.new_zeros(B, 1), None)
+                        var.new_zeros(B, 1), None, None)
             count = sums[2].unsqueeze(1) + torch.arange(
                 1, L + 1, device=X.device).float().view(1, L, 1)
             cum_bp = sums[0].unsqueeze(1) + bp.cumsum(1)
@@ -244,7 +342,7 @@ class SleepOnsetCNNGRU(nn.Module):
                 0.25 * self.chan_std.view(1, 1, C))
             parts_bp = [bp, rel]
             ema = sums[3]
-            if self.n_feats >= 2:
+            if self.use_ema:
                 emas = []
                 for i in range(L):
                     ema = (bp[:, i] if ema is None
@@ -252,7 +350,23 @@ class SleepOnsetCNNGRU(nn.Module):
                     emas.append(ema)
                 emas = torch.stack(emas, dim=1)
                 parts_bp += [bp - emas, emas - mean]
-            sums = (cum_bp[:, -1], cum_var[:, -1], count[:, -1], ema)
+            peaks = sums[4] if len(sums) > 4 else None
+            if self.use_peaks:
+                # Decaying peak of each movement marker's deviation from the
+                # recording's running mean: jumps to a new movement, then
+                # fades by 1 normalised unit per horizon.
+                move = rel[..., -N_MOVE:]
+                out_peaks = [[] for _ in self.peak_decay]
+                for i in range(L):
+                    x = move[:, i]
+                    peaks = [x if peaks is None else
+                             torch.maximum(x, pk - d)
+                             for pk, d in zip(peaks or [None] * len(
+                                 self.peak_decay), self.peak_decay)]
+                    for j, pk in enumerate(peaks):
+                        out_peaks[j].append(pk)
+                parts_bp += [torch.stack(o, dim=1) for o in out_peaks]
+            sums = (cum_bp[:, -1], cum_var[:, -1], count[:, -1], ema, peaks)
             bp_in = torch.cat(parts_bp, dim=-1)
         else:
             scale = self.chan_std.view(1, 1, C).expand(B, L, C)
@@ -306,11 +420,11 @@ class SleepOnsetEnsemble(nn.Module):
 
     def __init__(self, n_chans, n_times, sfreq, n_members=N_SEEDS,
                  adapt=ADAPT, use_cnn=USE_CNN, feats=FEATS,
-                 stage=STAGE_WEIGHT > 0):
+                 stage=STAGE_WEIGHT > 0, prep=PREP, ae=AE_MODE):
         super().__init__()
         self.members = nn.ModuleList(
             SleepOnsetCNNGRU(n_chans, n_times, sfreq, adapt, use_cnn, feats,
-                             stage)
+                             stage, prep, ae)
             for _ in range(n_members))
         self.register_buffer("quantile", torch.tensor(0.5))
 
@@ -519,8 +633,14 @@ def _batch_tensor(X_all, recs, start, stop, device):
 
 def _detach(state):
     h, sums = state
-    return h.detach(), None if sums is None else tuple(
-        None if s is None else s.detach() for s in sums)
+
+    def det(s):
+        if s is None:
+            return None
+        if isinstance(s, list):
+            return [x.detach() for x in s]
+        return s.detach()
+    return h.detach(), None if sums is None else tuple(det(s) for s in sums)
 
 
 @torch.no_grad()
@@ -564,7 +684,8 @@ def _train_member(model, seed, X_all, y_all, train_recs, val_recs, weights,
     """Train one member in place; keep its best epoch on validation."""
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
-    opt = torch.optim.AdamW(model.parameters(), lr=LR,
+    opt = torch.optim.AdamW([p for p in model.parameters()
+                             if p.requires_grad], lr=LR,
                             weight_decay=WEIGHT_DECAY)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, EPOCHS)
 
@@ -650,6 +771,57 @@ def _train_member(model, seed, X_all, y_all, train_recs, val_recs, weights,
     return best
 
 
+def _train_autoencoder(member, X_all, idx, device, tag, max_windows=80000):
+    """Fit ``member``'s spectral autoencoder on the windows ``idx`` (no
+    labels): sets spec_mean / spec_std and the frozen encoder ``ae_enc``."""
+    t0 = time.time()
+    gen = np.random.default_rng(len(idx))
+    idx = gen.choice(idx, min(max_windows, len(idx)), replace=False)
+    home = member.spec_mean.device
+    member.to(device)
+    with torch.no_grad():
+        S = torch.cat([member.ae_input(X_all[idx[i:i + 2048]].float()
+                                       .to(device))
+                       for i in range(0, len(idx), 2048)])
+    mean, std = S.mean(0), S.std(0).clamp_min(1e-3)
+    S = (S - mean) / std
+    n_hold = max(1, len(S) // 20)
+    S_val, S_tr = S[:n_hold], S[n_hold:]
+
+    torch.manual_seed(1000 * MEMBER_SEED + len(idx))
+    enc = nn.Sequential(nn.Linear(S.shape[1], AE_HIDDEN), nn.GELU(),
+                        nn.Linear(AE_HIDDEN, AE_DIM)).to(device)
+    dec = nn.Sequential(nn.Linear(AE_DIM, AE_HIDDEN), nn.GELU(),
+                        nn.Linear(AE_HIDDEN, S.shape[1])).to(device)
+    params = list(enc.parameters()) + list(dec.parameters())
+    opt = torch.optim.AdamW(params, lr=1e-3, weight_decay=1e-5)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, AE_EPOCHS)
+    for epoch in range(AE_EPOCHS):
+        perm = torch.randperm(len(S_tr), device=device)
+        total = 0.0
+        for i in range(0, len(S_tr), 512):
+            x = S_tr[perm[i:i + 512]]
+            # Denoising: Gaussian noise and 10 % of the inputs dropped.
+            noisy = (x + 0.1 * torch.randn_like(x)) * (
+                torch.rand_like(x) > 0.1).float()
+            loss = ((dec(enc(noisy)) - x) ** 2).mean()
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            total += loss.item() * len(x)
+        sched.step()
+    with torch.no_grad():
+        val = ((dec(enc(S_val)) - S_val) ** 2).mean().item()
+    print(f"[CNN-GRU AE {tag}] {len(S_tr)} windows, {S.shape[1]} inputs -> "
+          f"{AE_DIM}: train MSE {total / len(S_tr):.3f}, held-out MSE "
+          f"{val:.3f} (1.0 = predicting the mean) {time.time() - t0:.0f} s")
+    member.spec_mean.copy_(mean)
+    member.spec_std.copy_(std)
+    member.ae_enc.load_state_dict(enc.state_dict())
+    member.ae_enc.requires_grad_(False)
+    member.to(home)
+
+
 def _subsample_subjects(recs, frac):
     """Keep the recordings of a random ``frac`` of their subjects."""
     if frac >= 1.0:
@@ -704,19 +876,24 @@ class Solver(CompetSolver):
             # Older checkpoints predate these switches: CNN on, feats 1.
             use_cnn = bool(state.get("members.0.cnn_on", True))
             feats = int(state.get("members.0.feats", 1))
+            prep = int(state.get("members.0.prep_v", 1))
+            ae = int(state.get("members.0.ae_mode", 0))
             for i in range(n_members):
                 state.setdefault(f"members.{i}.cnn_on", torch.tensor(True))
                 state.setdefault(f"members.{i}.feats", torch.tensor(1))
+                state.setdefault(f"members.{i}.prep_v", torch.tensor(1))
+                state.setdefault(f"members.{i}.ae_mode", torch.tensor(0))
             # The staging head is training-only but saved with the weights.
             stage = any(".stage_head." in k for k in state)
         else:
             n_members, adapt, use_cnn, feats = N_SEEDS, ADAPT, USE_CNN, FEATS
+            prep, ae = PREP, AE_MODE
             if CV_FOLDS > 0:
                 n_members = CV_FOLDS           # one member per fold
             stage = STAGE_WEIGHT > 0
         model = SleepOnsetEnsemble(meta["n_chans"], meta["n_times"],
                                    float(meta["sfreq"]), n_members, adapt,
-                                   use_cnn, feats, stage)
+                                   use_cnn, feats, stage, prep, ae)
         if state is not None:
             model.load_state_dict(state)
         return model.to(meta["device"]).eval()
@@ -773,7 +950,8 @@ class Solver(CompetSolver):
               f"cnn={model.members[0].use_cnn}, "
               f"feats={model.members[0].n_feats}, extra={extra is not None}, "
               f"train_frac={TRAIN_FRAC}, seed={MEMBER_SEED}, "
-              f"stage_weight={STAGE_WEIGHT if use_stage else 0}")
+              f"stage_weight={STAGE_WEIGHT if use_stage else 0}, "
+              f"prep={model.members[0].prep}, ae={model.members[0].ae}")
         if use_stage:
             train_idx = np.concatenate([idx for idx, _ in train_recs])
             m = stage_m[train_idx]
@@ -790,14 +968,19 @@ class Solver(CompetSolver):
                                   replace=False)].float()
         chan_std = sample.std(dim=(0, 2)).clamp_min(1e-3)
         first = model.members[0]
+        out_device = model.quantile.device
+        device = _train_device(str(out_device))
+        if first.ae:
+            # One autoencoder on the training windows, shared by members.
+            _train_autoencoder(first, X_all, train_idx, device, "shared")
+            for m in model.members[1:]:
+                m.load_state_dict(first.state_dict())
         feats = first.band_powers(sample.to(first.chan_std.device))
         for m in model.members:
             m.chan_std.copy_(chan_std)
             m.bp_mean.copy_(feats.mean(0))
             m.bp_std.copy_(feats.std(0).clamp_min(1e-3))
 
-        out_device = model.quantile.device
-        device = _train_device(str(out_device))
         model.to(device)
         print(f"[CNN-GRU] training on {device}")
 
@@ -894,7 +1077,8 @@ class Solver(CompetSolver):
               f"{'/'.join(str((rec_fold == k).sum()) for k in range(K))} "
               f"recordings; cnn={model.members[0].use_cnn}, "
               f"feats={model.members[0].n_feats}, "
-              f"stage_weight={STAGE_WEIGHT if use_stage else 0}")
+              f"stage_weight={STAGE_WEIGHT if use_stage else 0}, "
+              f"prep={model.members[0].prep}, ae={model.members[0].ae}")
         if counts["test"]:
             print("[CNN-GRU] note: the warm-up test recordings are in "
                   "training, so this build's test W-bMAE is meaningless")
@@ -906,15 +1090,16 @@ class Solver(CompetSolver):
                                   replace=False)].float()
         chan_std = sample.std(dim=(0, 2)).clamp_min(1e-3)
         first = model.members[0]
-        feats = first.band_powers(sample.to(first.chan_std.device))
-        for m in model.members:
-            m.chan_std.copy_(chan_std)
-            m.bp_mean.copy_(feats.mean(0))
-            m.bp_std.copy_(feats.std(0).clamp_min(1e-3))
-
         out_device = model.quantile.device
         device = _train_device(str(out_device))
-        model.to(device)
+        if not first.ae:
+            feats = first.band_powers(sample.to(first.chan_std.device))
+        for m in model.members:
+            m.chan_std.copy_(chan_std)
+            if not first.ae:
+                m.bp_mean.copy_(feats.mean(0))
+                m.bp_std.copy_(feats.std(0).clamp_min(1e-3))
+
         print(f"[CNN-GRU] training on {device}")
 
         oof = [None] * len(recs)
@@ -922,6 +1107,20 @@ class Solver(CompetSolver):
             tr = [r for r, f in zip(recs, rec_fold) if f != k]
             va_i = [i for i, f in enumerate(rec_fold) if f == k]
             va = [recs[i] for i in va_i]
+            if member.ae:
+                # This fold's autoencoder and feature stats, from its
+                # training sleepers only (keeps the out-of-fold honest).
+                member.to(out_device)
+                tr_idx = np.concatenate([idx for idx, _ in tr])
+                _train_autoencoder(member, X_all, tr_idx, device,
+                                   f"fold {k + 1}/{K}")
+                s = X_all[rng.choice(tr_idx, min(20000, len(tr_idx)),
+                                     replace=False)].float()
+                with torch.no_grad():
+                    f_k = member.band_powers(s.to(member.chan_std.device))
+                member.bp_mean.copy_(f_k.mean(0))
+                member.bp_std.copy_(f_k.std(0).clamp_min(1e-3))
+            member.to(device)
             best = _train_member(member, 1000 * MEMBER_SEED + k, X_all, y_all,
                                  tr, va, weights, device,
                                  f"fold {k + 1}/{K}",
