@@ -19,7 +19,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "colab" / "train_on_colab.ipynb"
 EMBEDDED = sorted((ROOT / "submission").glob("*.py")) + [
-    ROOT / "scripts" / "build_submission.py"]
+    ROOT / "scripts" / "build_submission.py",
+    ROOT / "scripts" / "merge_builds.py",
+    ROOT / "scripts" / "prep_external.py"]
 REPO = "https://github.com/neural-interfaces26/2026-competition.git"
 # YASA teacher labels (scripts/yasa_check.py -> scripts/make_yasa_teacher.py),
 # embedded so Colab never has to install or run YASA.
@@ -71,7 +73,10 @@ solver locally.
 !nvidia-smi -L
 import torch
 print("torch", torch.__version__, "| CUDA:", torch.cuda.is_available())
-assert torch.cuda.is_available(), "Select a GPU runtime first."
+if not torch.cuda.is_available():
+    # Fine for the external-data prep (RUN_EXTERNAL_PREP with
+    # RUN_EXPERIMENTS = False); training runs stop later without a GPU.
+    print("WARNING: no GPU. Only the external-data prep can run in this session.")
 """),
         md("## Settings"),
         code(f"""
@@ -96,6 +101,18 @@ USE_DRIVE = ON_COLAB    # Colab: cache the data and save the results in Google D
 DRIVE_DIR = Path("/content/drive/MyDrive/EEG_sleep_foundation")
 # Where finished runs are saved (and restored from on a re-run).
 KAGGLE_RESULTS = Path("/kaggle/working/results")
+
+# External pseudo-Muse PSG windows (Sleep-EDF + HMC, scripts/prep_external.py).
+# RUN_EXTERNAL_PREP = True downloads and cuts them in this session (~1 h,
+# ~25 GB streamed, ~250 MB result in /kaggle/working); afterwards save that
+# file as a private Kaggle Dataset and attach it ("Add Input") so later
+# sessions find it under /kaggle/input and skip the download.
+RUN_EXTERNAL_PREP = False
+EXT_OUT = (Path("/kaggle/working") if ON_KAGGLE else PROJECT / "data") / "external_windows.npz"
+_found = sorted(Path("/kaggle/input").glob("**/external_windows.npz")) if ON_KAGGLE else []
+EXT_FILE = (_found[0] if _found else EXT_OUT if (RUN_EXTERNAL_PREP or EXT_OUT.exists())
+            else None)
+print("external windows:", EXT_FILE or "none (round 8 skips its external runs)")
 """),
         code("""
 # Drive can only be mounted by the Google account running this Colab session.
@@ -201,6 +218,24 @@ if CACHE is not None and not CACHE.exists():
     !tar -cf "{CACHE}" -C "{DATA}" neural_compet
     print("data cached in Drive:", CACHE)
 """),
+        md("""
+## External PSG windows (one-off; only with `RUN_EXTERNAL_PREP = True`)
+
+Streams Sleep-EDF (153 nights) and HMC (151 nights) from PhysioNet's open S3
+mirror one recording at a time and cuts their last minutes before the first
+N2 into pseudo-Muse windows (see `scripts/prep_external.py`). Then: **Save
+Version**, open the version's Output, **New Dataset** from
+`external_windows.npz`, and attach that dataset to this notebook ("Add
+Input"); set `RUN_EXTERNAL_PREP = False` again.
+"""),
+        code("""
+if RUN_EXTERNAL_PREP and not EXT_OUT.exists():
+    EXT_OUT.parent.mkdir(parents=True, exist_ok=True)
+    !pip install -q boto3
+    !cd "{PROJECT}" && python scripts/prep_external.py --out "{EXT_OUT}" --tmp "{BASE}" --workers 8
+elif EXT_FILE is not None:
+    print("using", EXT_FILE)
+"""),
         md("## Smoke test on synthetic data (seconds; the score is meaningless)"),
         code("""
 !SLEEP_N_SEEDS=1 python scripts/build_submission.py --solver submission/cnn_gru.py --label smoke_cnn --force 2>&1 | grep -E "CNN-GRU\\\\]|Error|Ready"
@@ -217,7 +252,51 @@ Every run is scored two ways:
 * **test W-bMAE**: the 40 warm-up recordings (sleepers **seen** in training),
   scored inference-only as on Codabench.
 
-**Round 6** (default, `ROUND = 6`) checks round 5's winner and combines it
+**Round 8** (default, `ROUND = 8`) is a sweep plus a merged ensemble, all
+cross-validated on all 540 recordings (one seed each, ~11 min per run):
+
+| Run | Change from the combo (autoencoder + hand-crafted + preprocessing v2) |
+|---|---|
+| `r8_combo` | none (seed 0; round 6's combo was seed 1) |
+| `r8_gru192` | GRU 192 units instead of 128 |
+| `r8_ae64` | autoencoder code 64 instead of 32 |
+| `r8_ema30` / `r8_ema120` | short-term trend over 30 s / 120 s instead of 60 s |
+| `r8_sigma3` | wider soft labels (3 bins instead of 1.5) |
+| `r8_chunk240` | backpropagation through 20 min instead of 10 |
+| `r8_lr5e4` | learning rate 5e-4, 40 epochs |
+| `r8_ae_only` | autoencoder replaces the hand-crafted features |
+| `r8_prep_only` | no autoencoder |
+| `r8_ext05` / `r8_ext1` | + external PSG windows (Sleep-EDF, HMC), loss weight 0.5 / 1 (only when `EXT_FILE` is set) |
+
+Every run saves its **out-of-fold distributions** (`*_oof.npz`). The merge
+cell then picks the best weighted mix of all runs on them and writes
+`r8_merged.zip`. A single run beats the combo only if its `oof540` is lower
+by more than ~0.5 s (one seed's noise); the merged ensemble is judged by its
+honest fold-5 check.
+
+External data (one-off): set `RUN_EXTERNAL_PREP = True` for one session (see
+the External PSG section), save its output as a Kaggle Dataset and attach it;
+later sessions pick it up automatically.
+
+**Round 7** (`ROUND = 7`) built the candidate final submission: the
+round 6 winner (**combo**: autoencoder + hand-crafted features + preprocessing
+v2) as a **2-seed cross-validated ensemble**, 2 models per fold = 10 models,
+trained on all 540 recordings (`SLEEP_CV_SEEDS=2`, about twice a normal CV
+run).
+
+Round 6 (out-of-fold over 540 recordings; seed 0 from round 5):
+
+| Build | seed 0 | seed 1 |
+|---|---|---|
+| base | 42.4 | 41.9 |
+| autoencoder + hand | 41.0 | 41.6 |
+| **combo** (+ preprocessing v2) | – | **40.8** |
+
+A new seed moves a build by about 0.5 s; averaging seeds removes that noise.
+The log prints each seed alone and the 10-model ensemble, all out-of-fold,
+so the gain from the second seed is measured directly.
+
+**Round 6** (`ROUND = 6`) checked round 5's winner and combines it
 with the preprocessing fix. Round 5 (seed 0, out-of-fold over 540
 recordings): base 42.4, preprocessing v2 41.5, autoencoder only 41.7,
 **autoencoder + hand-crafted 41.0** (better in all 5 folds). Round 6 reruns
@@ -337,23 +416,43 @@ retrain.
         code("""
 import os, shutil
 
-ROUND = 6
+ROUND = 8
 R5_FEATS = 2                # round 5 base features: 2 (round 4: movement features, 3, were a tie)
 SEEDS = [0, 1, 2]
 RUN_EXPERIMENTS = True      # the experiment runs of ROUND (False: skip them)
 RUN_PRODUCTION = False      # build the sealed-phase submission
-PRODUCTION_LABEL = "gru_cv5_all"
+PRODUCTION_LABEL = "combo_cv5x2_all"
 # 5-fold cross-validated ensemble on all 540 public recordings; solver
 # defaults: no CNN, feats 2, extra data, no staging output. If round 3's
 # staging output wins, add e.g. "SLEEP_STAGE_WEIGHT": "0.5" (and change the
 # label, so Drive does not restore the earlier build).
-PRODUCTION_ENV = {"SLEEP_CV_FOLDS": "5", "SLEEP_USE_TEST": "1"}
+PRODUCTION_ENV = {"SLEEP_CV_FOLDS": "5", "SLEEP_CV_SEEDS": "2", "SLEEP_USE_TEST": "1",
+                  "SLEEP_FEATS": "2", "SLEEP_AE": "2", "SLEEP_PREP": "2"}
 
 GBM, CNN = "submission/gbm.py", "submission/cnn_gru.py"
 # Round 1 settings spelled out, since the solver defaults changed after it.
 V1 = {"SLEEP_N_SEEDS": "1", "SLEEP_ADAPT": "1", "SLEEP_USE_CNN": "1",
       "SLEEP_FEATS": "1", "SLEEP_EXTRA_DATA": "0"}
 GRU = {"SLEEP_N_SEEDS": "1", "SLEEP_ADAPT": "1", "SLEEP_USE_CNN": "0"}
+# Round 8: sweep around the combo (autoencoder + hand-crafted features +
+# preprocessing v2), 5-fold CV on all 540 recordings, one seed each.
+C = {"SLEEP_CV_FOLDS": "5", "SLEEP_USE_TEST": "1", "SLEEP_FEATS": "2",
+     "SLEEP_AE": "2", "SLEEP_PREP": "2"}
+R8 = [
+    ("r8_combo",         CNN, C),
+    ("r8_gru192",        CNN, {**C, "SLEEP_GRU_HIDDEN": "192"}),
+    ("r8_ae64",          CNN, {**C, "SLEEP_AE_DIM": "64"}),
+    ("r8_ema30",         CNN, {**C, "SLEEP_EMA_S": "30"}),
+    ("r8_ema120",        CNN, {**C, "SLEEP_EMA_S": "120"}),
+    ("r8_sigma3",        CNN, {**C, "SLEEP_LABEL_SIGMA": "3"}),
+    ("r8_chunk240",      CNN, {**C, "SLEEP_CHUNK": "240"}),
+    ("r8_lr5e4",         CNN, {**C, "SLEEP_LR": "5e-4", "SLEEP_EPOCHS": "40"}),
+    ("r8_ae_only",       CNN, {**C, "SLEEP_AE": "1"}),
+    ("r8_prep_only",     CNN, {**C, "SLEEP_AE": "0"}),
+]
+if EXT_FILE is not None:
+    R8 += [("r8_ext05", CNN, {**C, "SLEEP_EXTERNAL": str(EXT_FILE), "SLEEP_EXT_WEIGHT": "0.5"}),
+           ("r8_ext1",  CNN, {**C, "SLEEP_EXTERNAL": str(EXT_FILE), "SLEEP_EXT_WEIGHT": "1.0"})]
 EXPERIMENTS = {
     1: [  # (name,           solver, env)
         ("gbm_time",         GBM, {"SLEEP_GBM_FEATURES": "time"}),
@@ -388,13 +487,18 @@ EXPERIMENTS = {
         ("r5_ae_hand_cv",    CNN, {"SLEEP_CV_FOLDS": "5", "SLEEP_USE_TEST": "1", "SLEEP_FEATS": "2", "SLEEP_AE": "2"}),
         ("r6_combo_cv",      CNN, {"SLEEP_CV_FOLDS": "5", "SLEEP_USE_TEST": "1", "SLEEP_FEATS": "2", "SLEEP_AE": "2", "SLEEP_PREP": "2"}),
     ],
+    7: [  # the candidate final build: combo, 5 folds x 2 seeds (see markdown)
+        ("r7_combo_cv2",     CNN, {"SLEEP_CV_FOLDS": "5", "SLEEP_CV_SEEDS": "2", "SLEEP_USE_TEST": "1",
+                                   "SLEEP_FEATS": "2", "SLEEP_AE": "2", "SLEEP_PREP": "2"}),
+    ],
+    8: R8,
     3: [
         ("r3_base",          CNN, {**GRU, "SLEEP_STAGE_WEIGHT": "0"}),
         ("r3_stage05",       CNN, {**GRU, "SLEEP_STAGE_WEIGHT": "0.5"}),
         ("r3_stage1",        CNN, {**GRU, "SLEEP_STAGE_WEIGHT": "1.0"}),
     ],
 }[ROUND]
-if ROUND in (4, 5):
+if ROUND in (4, 5, 7, 8):
     SEEDS = [0]
 if ROUND == 6:
     SEEDS = [1]     # each run is already a 5-model ensemble over 540 recordings
@@ -416,10 +520,12 @@ def restore(label):
     \"\"\"Copy a finished run back from Drive; True if it was there.\"\"\"
     if RESULTS is None or not (RESULTS / f"{label}_eval.parquet").exists():
         return False
-    for name in ("eval.parquet", "train.parquet", "valpred.npz"):
+    for name in ("eval.parquet", "train.parquet", "valpred.npz", "oof.npz"):
         src = RESULTS / f"{label}_{name}"
         if src.exists():
             shutil.copy(src, BUILD)
+    if (RESULTS / label).is_dir():          # weights, for merging
+        shutil.copytree(RESULTS / label, BUILD / label, dirs_exist_ok=True)
     if (RESULTS / f"{label}.log").exists():
         shutil.copy(RESULTS / f"{label}.log", BUILD)
     return True
@@ -446,12 +552,56 @@ def build(label, solver, env_extra):
                 shutil.copy(f, RESULTS)
         shutil.copy(PROJECT / "dist" / f"{label}.zip", RESULTS)
 
+if RUNS and not torch.cuda.is_available() and not all(
+        (RESULTS is not None and (RESULTS / f"{l}_eval.parquet").exists()) for l, _, _ in RUNS):
+    raise RuntimeError("Training needs a GPU runtime (Kaggle: GPU T4 x2). For the "
+                       "external-data prep alone set RUN_EXPERIMENTS = False.")
 for label, solver, env_extra in RUNS:
     if restore(label):
         print(f"===== {label}: restored from Drive")
         continue
     print(f"===== {label}: {env_extra}")
     build(label, solver, env_extra)
+"""),
+        md("""
+### Merged ensemble (round 8)
+
+`scripts/merge_builds.py` mixes the finished CV builds (plus `r7_combo_cv2_s0`
+and `r6_combo_cv_s1` if their results are present) by greedy selection on
+their out-of-fold distributions, tunes a quantile per elapsed-time bucket,
+and writes one submission, `r8_merged.zip`. Its first line of interest is
+the **honest check** (selection fitted on folds 1-4, scored on fold 5);
+then the final out-of-fold score of the ensemble vs the best single build.
+"""),
+        code("""
+MERGED = "r8_merged"
+_have = ROUND == 8 and any((BUILD / f"{l}_oof.npz").exists() or restore(l) for l, _, _ in RUNS)
+if ROUND == 8 and not _have:
+    print("no finished round 8 runs to merge")
+if _have:
+    for extra in ("r7_combo_cv2_s0", "r6_combo_cv_s1"):
+        restore(extra)
+    cands = [l for l, _, _ in RUNS] + ["r7_combo_cv2_s0", "r6_combo_cv_s1"]
+    cands = [l for l in cands if (BUILD / f"{l}_oof.npz").exists()]
+    print("merging:", cands)
+    log_path = BUILD / f"{MERGED}.log"
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(["python", "scripts/merge_builds.py", "--label", MERGED, *cands],
+                                cwd=PROJECT, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+        for line in proc.stdout:
+            log.write(line)
+            if not line.startswith(("+", "[")) or "Error" in line:
+                print(line, end="")
+    if proc.wait() != 0:
+        raise RuntimeError(f"merge failed; see {log_path}")
+    if RESULTS is not None:
+        RESULTS.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(BUILD / MERGED, RESULTS / MERGED, dirs_exist_ok=True)
+        for f in run_files(MERGED):
+            if f.exists():
+                shutil.copy(f, RESULTS)
+        shutil.copy(PROJECT / "dist" / f"{MERGED}.zip", RESULTS)
 """),
         md("""
 ## 1. Summary
@@ -662,6 +812,26 @@ blends.round(1)
         md("""
 ## 5. Decide
 
+**Round 8.** Read the merge cell's output:
+
+* **Honest check: ensemble clearly below the best single build on fold 5**
+  (≳ 0.5 s): upload `r8_merged.zip` (results folder). It is a complete
+  submission.
+* **Not clearly better:** upload the best single build's ZIP by `oof540`.
+* Sweep runs that beat `r8_combo` by more than ~0.5 s point to settings to
+  keep in later builds; `r8_ext*` vs `r8_combo` is the external-data verdict.
+
+**Round 7.** In the log of `r7_combo_cv2_s0`, compare the line `out-of-fold
+W-bMAE ... on all 540 recordings` (the 10-model ensemble) with the two
+`seed N alone` lines above it.
+
+* **Ensemble below 40.8 (round 6's combo):** upload `r7_combo_cv2_s0.zip`.
+  It is the complete final submission (10 models, all 540 recordings).
+* **Not lower:** keep `r6_combo_cv_s1.zip`.
+
+The streaming-check line also gives the inference time per window for
+all 10 models.
+
 **Round 6.** First the seed noise: `r4_base_cv_s1` vs round 5's 42.4.
 Then `r5_ae_hand_cv_s1` vs `r4_base_cv_s1`:
 
@@ -728,7 +898,7 @@ import zipfile
 
 out = PROJECT / "experiment_results.zip"
 with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-    for label, _, _ in RUNS:
+    for label in [l for l, _, _ in RUNS] + (["r8_merged"] if ROUND == 8 else []):
         for f in run_files(label):
             if f.exists():
                 zf.write(f, f.name)

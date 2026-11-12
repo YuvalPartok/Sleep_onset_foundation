@@ -1,0 +1,3 @@
+# External PSG training windows (235 MB, rebuilt by scripts/prep_external.py)
+external_windows/
+external_windows.npz

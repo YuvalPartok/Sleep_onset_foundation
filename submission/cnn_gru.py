@@ -82,7 +82,7 @@ RANGE_WEIGHTS = (10.0, 5.0, 3.0, 1.0)
 
 CNN_CHANNELS = (32, 64, 96, 128)
 BP_DIM = 64
-GRU_HIDDEN = 128
+GRU_HIDDEN = int(os.environ.get("SLEEP_GRU_HIDDEN", 128))
 GRU_LAYERS = 2
 DROPOUT = 0.2
 
@@ -101,14 +101,14 @@ EXTRA_DATA = os.environ.get("SLEEP_EXTRA_DATA", "1") == "1"
 # on any of these settings, so runs stay comparable.
 TRAIN_FRAC = float(os.environ.get("SLEEP_TRAIN_FRAC", 1.0))
 MEMBER_SEED = int(os.environ.get("SLEEP_SEED", 0))
-EMA_S = 60.0                             # short-term EMA time constant
+EMA_S = float(os.environ.get("SLEEP_EMA_S", 60.0))  # short-term EMA, s
 N_MOVE = 3                               # movement markers (feats >= 3)
 PEAK_S = (60.0, 300.0)                   # decaying-peak horizons (feats >= 3)
 # Staging output: loss weight (0 = off) and the YASA teacher labels.
 STAGE_WEIGHT = float(os.environ.get("SLEEP_STAGE_WEIGHT", 0.0))
 PREP = int(os.environ.get("SLEEP_PREP", 1))     # 2: notch + Welch
 AE_MODE = int(os.environ.get("SLEEP_AE", 0))     # 1 replace, 2 add
-AE_DIM = 32                              # autoencoder code size
+AE_DIM = int(os.environ.get("SLEEP_AE_DIM", 32))  # autoencoder code size
 AE_HIDDEN = 128
 AE_EPOCHS = int(os.environ.get("SLEEP_AE_EPOCHS", 20))
 LINE_HZ = (48.0, 52.0)                   # mains band skipped with PREP >= 2
@@ -123,17 +123,28 @@ N_STAGES = 3                             # wake, drowsy (N1 + REM), N2+
 # trains on the 40 public warm-up test recordings (the warm-up is over; the
 # local test score is then meaningless).
 CV_FOLDS = int(os.environ.get("SLEEP_CV_FOLDS", 0))
+# Members per fold (repeats with seeds SLEEP_SEED, SLEEP_SEED + 1, ...): the
+# ensemble then has CV_FOLDS * CV_SEEDS members, and each recording's
+# out-of-fold distribution is the mean over its fold's members.
+CV_SEEDS = int(os.environ.get("SLEEP_CV_SEEDS", 1))
 USE_TEST = os.environ.get("SLEEP_USE_TEST", "0") == "1"
 
 EPOCHS = int(os.environ.get("SLEEP_EPOCHS", 30))
 PATIENCE = 8
-LR = 1e-3
+LR = float(os.environ.get("SLEEP_LR", 1e-3))
 WEIGHT_DECAY = 1e-4
 RECS_PER_BATCH = 16
-CHUNK = 120                              # TBPTT length, in windows (10 min)
+CHUNK = int(os.environ.get("SLEEP_CHUNK", 120))  # TBPTT length, windows
 VAL_FRACTION = 0.15
-LABEL_SIGMA = 1.5                        # soft-label width, in bins
-L1_WEIGHT = 0.1
+LABEL_SIGMA = float(os.environ.get("SLEEP_LABEL_SIGMA", 1.5))  # in bins
+L1_WEIGHT = float(os.environ.get("SLEEP_L1", 0.1))
+# External pseudo-Muse PSG windows (scripts/prep_external.py), CV mode only:
+# added to every fold's training set with their loss weight scaled by
+# EXT_WEIGHT; a domain flag input tells them apart (always 0 at inference).
+EXTERNAL = os.environ.get("SLEEP_EXTERNAL", "")
+EXT_WEIGHT = float(os.environ.get("SLEEP_EXT_WEIGHT", 0.5))
+# Elapsed-time buckets (minutes) of the per-bucket quantile ``q_time``.
+TIME_EDGES_MIN = (2.0, 5.0, 10.0, 20.0)
 QUANTILES = (0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6)
 SEED = 0                                 # validation split seed (fixed)
 
@@ -156,9 +167,13 @@ class SleepOnsetCNNGRU(nn.Module):
     """One member: (B, L, C, T) sequences -> logits (B, L, K) over bins."""
 
     def __init__(self, n_chans, n_times, sfreq, adapt=ADAPT, use_cnn=USE_CNN,
-                 feats=FEATS, stage=STAGE_WEIGHT > 0, prep=PREP, ae=AE_MODE):
+                 feats=FEATS, stage=STAGE_WEIGHT > 0, prep=PREP, ae=AE_MODE,
+                 hidden=GRU_HIDDEN, ae_dim=AE_DIM, ema_s=EMA_S, dom=False):
         super().__init__()
         self.prep, self.ae = int(prep), int(ae)
+        self.hidden, self.dom = int(hidden), bool(dom)
+        self.register_buffer("ema_s", torch.tensor(float(ema_s)))
+        self.register_buffer("dom_on", torch.tensor(self.dom))
         self.register_buffer("prep_v", torch.tensor(self.prep))
         self.register_buffer("ae_mode", torch.tensor(self.ae))
         self.n_chans, self.n_times, self.sfreq = n_chans, n_times, sfreq
@@ -166,7 +181,7 @@ class SleepOnsetCNNGRU(nn.Module):
         self.use_adapt = bool(adapt)
         self.use_cnn = bool(use_cnn)
         self.n_feats = int(feats)
-        self.ema_alpha = min(1.0, self.window_s / EMA_S)
+        self.ema_alpha = min(1.0, self.window_s / float(ema_s))
         self.register_buffer("adapt", torch.tensor(self.use_adapt))
         self.register_buffer("cnn_on", torch.tensor(self.use_cnn))
         self.register_buffer("feats", torch.tensor(self.n_feats))
@@ -216,7 +231,7 @@ class SleepOnsetCNNGRU(nn.Module):
             self.register_buffer("spec_mean", torch.zeros(ae_in))
             self.register_buffer("spec_std", torch.ones(ae_in))
             self.ae_enc = nn.Sequential(nn.Linear(ae_in, AE_HIDDEN), nn.GELU(),
-                                        nn.Linear(AE_HIDDEN, AE_DIM))
+                                        nn.Linear(AE_HIDDEN, int(ae_dim)))
             self.ae_enc.requires_grad_(False)   # trained beforehand, frozen
         else:
             self.ae_enc = None
@@ -242,15 +257,15 @@ class SleepOnsetCNNGRU(nn.Module):
         self.bp_proj = nn.Sequential(nn.Linear(bp_in, BP_DIM), nn.GELU())
         cnn_dim = 2 * CNN_CHANNELS[-1] if self.use_cnn else 0
         self.in_proj = nn.Sequential(
-            nn.Linear(cnn_dim + BP_DIM + 1, GRU_HIDDEN),
+            nn.Linear(cnn_dim + BP_DIM + 1 + int(self.dom), self.hidden),
             nn.GELU(), nn.Dropout(DROPOUT))
-        self.gru = nn.GRU(GRU_HIDDEN, GRU_HIDDEN, GRU_LAYERS, batch_first=True,
+        self.gru = nn.GRU(self.hidden, self.hidden, GRU_LAYERS, batch_first=True,
                           dropout=DROPOUT)
         self.head = nn.Sequential(nn.Dropout(DROPOUT),
-                                  nn.Linear(GRU_HIDDEN, N_BINS))
+                                  nn.Linear(self.hidden, N_BINS))
         # Training-only auxiliary head (see module docstring).
         self.stage_head = (nn.Sequential(nn.Dropout(DROPOUT),
-                                         nn.Linear(GRU_HIDDEN, N_STAGES))
+                                         nn.Linear(self.hidden, N_STAGES))
                            if stage else None)
         self.reset_state()
 
@@ -315,7 +330,7 @@ class SleepOnsetCNNGRU(nn.Module):
                           + 1e-3)], dim=1))
         return torch.cat(out, dim=1)
 
-    def encode(self, X, start_index, sums):
+    def encode(self, X, start_index, sums, dom=None):
         """Sequences (B, L, C, T) -> GRU inputs (B, L, H), new running sums.
 
         ``sums`` = (sum of band powers (B, F), sum of channel variances
@@ -381,10 +396,18 @@ class SleepOnsetCNNGRU(nn.Module):
         idx = idx + torch.as_tensor(start_index, device=X.device,
                                     dtype=torch.float32).reshape(-1, 1)
         t = torch.log1p(idx.expand(B, L) * self.window_s / 60.0).unsqueeze(-1)
-        z = self.in_proj(torch.cat(parts + [self.bp_proj(bp_in), t], dim=-1))
+        extra = [t]
+        if self.dom:
+            # Domain flag: 1 for external PSG recordings (training only).
+            d = (torch.zeros(B, device=X.device) if dom is None
+                 else dom.to(X.device).float())
+            extra.append(d.view(B, 1, 1).expand(B, L, 1))
+        z = self.in_proj(torch.cat(parts + [self.bp_proj(bp_in)] + extra,
+                                   dim=-1))
         return z, sums
 
-    def forward(self, X, start_index=0, state=None, return_stage=False):
+    def forward(self, X, start_index=0, state=None, return_stage=False,
+                dom=None):
         """Sequences (B, L, C, T) of consecutive windows -> logits (B, L, K).
 
         ``start_index`` is the index of the first window in its recording
@@ -393,7 +416,7 @@ class SleepOnsetCNNGRU(nn.Module):
         ``return_stage`` the staging logits (B, L, 3) come second.
         """
         h, sums = state if state is not None else (None, None)
-        z, sums = self.encode(X, start_index, sums)
+        z, sums = self.encode(X, start_index, sums, dom)
         out, h = self.gru(z, h)
         if return_stage:
             return self.head(out), self.stage_head(out), (h, sums)
@@ -420,30 +443,62 @@ class SleepOnsetEnsemble(nn.Module):
 
     def __init__(self, n_chans, n_times, sfreq, n_members=N_SEEDS,
                  adapt=ADAPT, use_cnn=USE_CNN, feats=FEATS,
-                 stage=STAGE_WEIGHT > 0, prep=PREP, ae=AE_MODE):
+                 stage=STAGE_WEIGHT > 0, prep=PREP, ae=AE_MODE,
+                 configs=None, dom=False):
         super().__init__()
+        # ``configs``: one dict of member settings per member (mixed
+        # ensembles, see scripts/merge_builds.py); else n_members alike.
+        if configs is None:
+            configs = [dict(adapt=adapt, use_cnn=use_cnn, feats=feats,
+                            stage=stage, prep=prep, ae=ae, dom=dom)
+                       for _ in range(n_members)]
         self.members = nn.ModuleList(
-            SleepOnsetCNNGRU(n_chans, n_times, sfreq, adapt, use_cnn, feats,
-                             stage, prep, ae)
-            for _ in range(n_members))
+            SleepOnsetCNNGRU(n_chans, n_times, sfreq, **c) for c in configs)
         self.register_buffer("quantile", torch.tensor(0.5))
+        # Averaging weights of the members, and the quantile per elapsed-time
+        # bucket (TIME_EDGES_MIN); both default to plain averaging / q.
+        self.register_buffer("member_w", torch.ones(len(configs)))
+        self.register_buffer("q_time", torch.full(
+            (len(TIME_EDGES_MIN) + 1,), 0.5))
+
+    def set_quantile(self, q):
+        self.quantile.fill_(float(q))
+        self.q_time.fill_(float(q))
+
+    def q_for(self, start, n):
+        """Quantiles (n,) of windows start .. start + n - 1 of a recording."""
+        window_s = self.members[0].window_s
+        minutes = (start + torch.arange(n, device=self.q_time.device)
+                   ) * window_s / 60.0
+        edges = torch.tensor(TIME_EDGES_MIN, device=self.q_time.device)
+        return self.q_time[torch.bucketize(minutes, edges, right=True)]
 
     def _step_proba(self, X):
-        return torch.stack([m.step_proba(X) for m in self.members]).mean(0)
+        w = self.member_w / self.member_w.sum()
+        return (torch.stack([m.step_proba(X) for m in self.members])
+                * w.view(-1, 1, 1)).sum(0)
+
+    def _seconds(self, p, start):
+        q = self.q_for(start, p.shape[0])
+        cdf = p.cumsum(-1).contiguous()
+        k = torch.searchsorted(cdf, q.view(-1, 1).to(cdf.dtype))
+        return (k.clamp_max(N_BINS - 1).squeeze(-1) * BIN_S).float(
+        ).clamp(0.0, CAP_S)
 
     @torch.inference_mode()
     def predict(self, X):
         self.eval()
+        start = self.members[0]._n
         p = self._step_proba(X)
-        return quantile_seconds(p, self.quantile.item()).clamp(0.0, CAP_S)
+        return self._seconds(p, start)
 
     @torch.inference_mode()
     def predict_dist(self, X):
         """(seconds, p over 5 s bins, hazard) for analysis; advances state."""
         self.eval()
+        start = self.members[0]._n
         p = self._step_proba(X)
-        seconds = quantile_seconds(p, self.quantile.item()).clamp(0.0, CAP_S)
-        return seconds, p, p[..., 0]
+        return self._seconds(p, start), p, p[..., 0]
 
     def reset_state(self):
         for m in self.members:
@@ -680,7 +735,7 @@ def _train_device(default):
 
 
 def _train_member(model, seed, X_all, y_all, train_recs, val_recs, weights,
-                  device, tag, stage_all=None):
+                  device, tag, stage_all=None, ext_mask=None):
     """Train one member in place; keep its best epoch on validation."""
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
@@ -716,15 +771,18 @@ def _train_member(model, seed, X_all, y_all, train_recs, val_recs, weights,
                     st[b, :len(idx)] = stage_all[0][idx]
                     sm[b, :len(idx)] = stage_all[1][idx].float()
             y, w = y.to(device), w.to(device)
+            dom = (torch.tensor([bool(ext_mask[idx[0]]) for idx in idxs])
+                   if ext_mask is not None and model.dom else None)
             st, sm = st.to(device), sm.to(device)
             state = None
             for s in range(0, max_len, CHUNK):
                 X, mask = _batch_tensor(X_all, idxs, s, s + CHUNK, device)
                 if use_stage:
                     logits, stage_logits, state = model(_augment(X), s, state,
-                                                        return_stage=True)
+                                                        return_stage=True,
+                                                        dom=dom)
                 else:
-                    logits, state = model(_augment(X), s, state)
+                    logits, state = model(_augment(X), s, state, dom=dom)
                 state = _detach(state)
                 yc, wc = y[:, s:s + CHUNK], w[:, s:s + CHUNK] * mask
                 logp = logits.log_softmax(-1)
@@ -771,7 +829,8 @@ def _train_member(model, seed, X_all, y_all, train_recs, val_recs, weights,
     return best
 
 
-def _train_autoencoder(member, X_all, idx, device, tag, max_windows=80000):
+def _train_autoencoder(member, X_all, idx, device, tag, max_windows=80000,
+                       seed=None):
     """Fit ``member``'s spectral autoencoder on the windows ``idx`` (no
     labels): sets spec_mean / spec_std and the frozen encoder ``ae_enc``."""
     t0 = time.time()
@@ -788,10 +847,12 @@ def _train_autoencoder(member, X_all, idx, device, tag, max_windows=80000):
     n_hold = max(1, len(S) // 20)
     S_val, S_tr = S[:n_hold], S[n_hold:]
 
-    torch.manual_seed(1000 * MEMBER_SEED + len(idx))
+    torch.manual_seed(1000 * (MEMBER_SEED if seed is None else seed)
+                      + len(idx))
+    ae_dim = member.ae_enc[2].out_features
     enc = nn.Sequential(nn.Linear(S.shape[1], AE_HIDDEN), nn.GELU(),
-                        nn.Linear(AE_HIDDEN, AE_DIM)).to(device)
-    dec = nn.Sequential(nn.Linear(AE_DIM, AE_HIDDEN), nn.GELU(),
+                        nn.Linear(AE_HIDDEN, ae_dim)).to(device)
+    dec = nn.Sequential(nn.Linear(ae_dim, AE_HIDDEN), nn.GELU(),
                         nn.Linear(AE_HIDDEN, S.shape[1])).to(device)
     params = list(enc.parameters()) + list(dec.parameters())
     opt = torch.optim.AdamW(params, lr=1e-3, weight_decay=1e-5)
@@ -813,7 +874,7 @@ def _train_autoencoder(member, X_all, idx, device, tag, max_windows=80000):
     with torch.no_grad():
         val = ((dec(enc(S_val)) - S_val) ** 2).mean().item()
     print(f"[CNN-GRU AE {tag}] {len(S_tr)} windows, {S.shape[1]} inputs -> "
-          f"{AE_DIM}: train MSE {total / len(S_tr):.3f}, held-out MSE "
+          f"{ae_dim}: train MSE {total / len(S_tr):.3f}, held-out MSE "
           f"{val:.3f} (1.0 = predicting the mean) {time.time() - t0:.0f} s")
     member.spec_mean.copy_(mean)
     member.spec_std.copy_(std)
@@ -857,45 +918,107 @@ def _save_val_predictions(val_recs, rec, sub, y_all, preds):
     print(f"[CNN-GRU] validation predictions -> {out}")
 
 
+def member_configs(state):
+    """Per-member settings of a saved ensemble state dict.
+
+    Older checkpoints predate some switches: CNN on, feats 1, prep 1, no
+    autoencoder, 60 s EMA, no domain flag; the missing buffers are added to
+    ``state`` with those values so it loads strictly.
+    """
+    n = len({k.split(".")[1] for k in state if k.startswith("members.")})
+    configs = []
+    for i in range(n):
+        pre = f"members.{i}."
+        for key, val in (("cnn_on", True), ("feats", 1), ("prep_v", 1),
+                         ("ae_mode", 0), ("ema_s", 60.0), ("dom_on", False)):
+            state.setdefault(pre + key, torch.tensor(val))
+        ae = int(state[pre + "ae_mode"])
+        configs.append(dict(
+            adapt=bool(state[pre + "adapt"]),
+            use_cnn=bool(state[pre + "cnn_on"]),
+            feats=int(state[pre + "feats"]),
+            stage=any(k.startswith(pre + "stage_head.") for k in state),
+            prep=int(state[pre + "prep_v"]), ae=ae,
+            hidden=int(state[pre + "gru.weight_hh_l0"].shape[1]),
+            ae_dim=int(state[pre + "ae_enc.2.weight"].shape[0]) if ae
+            else AE_DIM,
+            ema_s=float(state[pre + "ema_s"]),
+            dom=bool(state[pre + "dom_on"])))
+    return configs
+
+
+def ensemble_from_state(state, n_chans, n_times, sfreq):
+    """Saved state dict -> the SleepOnsetEnsemble it came from."""
+    configs = member_configs(state)
+    q = state["quantile"]
+    state.setdefault("member_w", torch.ones(len(configs)))
+    state.setdefault("q_time", torch.full((len(TIME_EDGES_MIN) + 1,),
+                                          float(q)))
+    model = SleepOnsetEnsemble(n_chans, n_times, sfreq, configs=configs)
+    model.load_state_dict(state)
+    return model
+
+
+def _load_external(path):
+    """scripts/prep_external.py output -> (windows, y, rec, onset, subject).
+
+    Windows are raw microvolts (float16); they get the Muse preprocessing.
+    """
+    d = np.load(path)
+    X = preprocess(torch.from_numpy(d["X"]).float()).half()
+    return (X, torch.from_numpy(d["y"]).float(), d["rec"].astype(np.int64),
+            d["onset"].astype(np.float64), d["subject"].astype(str),
+            d["dataset"].astype(str))
+
+
+def _save_oof(recs, rec_split, rec_fold, names, y_all, probas, q):
+    """Out-of-fold distributions of a CV build -> build/<label>_oof.npz.
+
+    For offline analysis and scripts/merge_builds.py: per window the
+    recording index (into the build's recordings, same order in every CV
+    build), position, target and the (K,) distribution (float16); per
+    recording its split, fold and sleeper. Never shipped in the ZIP.
+    """
+    sub_dir = os.environ.get("COMPET_SUBMISSION_DIR")
+    if not sub_dir:
+        return
+    sub_dir = os.path.abspath(sub_dir)
+    out = os.path.join(os.path.dirname(sub_dir),
+                       os.path.basename(sub_dir) + "_oof.npz")
+    np.savez_compressed(
+        out,
+        record=np.concatenate([np.full(len(i), k) for k, (i, _)
+                               in enumerate(recs)]),
+        position=np.concatenate([np.arange(len(i)) for i, _ in recs]),
+        y=np.concatenate([y_all[i].numpy() for i, _ in recs]),
+        proba=torch.cat([p.float().cpu() for p in probas]).half().numpy(),
+        rec_split=np.asarray(rec_split).astype(str),
+        rec_fold=np.asarray(rec_fold),
+        rec_subject=np.asarray([names[i[0]] for i, _ in recs]).astype(str),
+        quantile=np.float32(q))
+    print(f"[CNN-GRU] out-of-fold distributions -> {out}")
+
+
 class Solver(CompetSolver):
 
     name = "CNN-GRU-Hazard"
 
     def load_model(self, meta):
         weights = meta["submission_dir"] / WEIGHTS_FILE
-        state = None
-        # Inference (Codabench): load the shipped weights, which also fix the
-        # ensemble size and the adaptation flag. A local training run
-        # (train_loader set) starts from scratch instead.
+        # Inference (Codabench): load the shipped weights, which fix every
+        # member's own settings (a merged ensemble may mix them). A local
+        # training run (train_loader set) starts from scratch instead.
         if weights.exists() and self.train_loader is None:
             state = torch.load(weights, map_location=meta["device"],
                                weights_only=True)
-            n_members = len({k.split(".")[1] for k in state
-                             if k.startswith("members.")})
-            adapt = bool(state["members.0.adapt"])
-            # Older checkpoints predate these switches: CNN on, feats 1.
-            use_cnn = bool(state.get("members.0.cnn_on", True))
-            feats = int(state.get("members.0.feats", 1))
-            prep = int(state.get("members.0.prep_v", 1))
-            ae = int(state.get("members.0.ae_mode", 0))
-            for i in range(n_members):
-                state.setdefault(f"members.{i}.cnn_on", torch.tensor(True))
-                state.setdefault(f"members.{i}.feats", torch.tensor(1))
-                state.setdefault(f"members.{i}.prep_v", torch.tensor(1))
-                state.setdefault(f"members.{i}.ae_mode", torch.tensor(0))
-            # The staging head is training-only but saved with the weights.
-            stage = any(".stage_head." in k for k in state)
-        else:
-            n_members, adapt, use_cnn, feats = N_SEEDS, ADAPT, USE_CNN, FEATS
-            prep, ae = PREP, AE_MODE
-            if CV_FOLDS > 0:
-                n_members = CV_FOLDS           # one member per fold
-            stage = STAGE_WEIGHT > 0
-        model = SleepOnsetEnsemble(meta["n_chans"], meta["n_times"],
-                                   float(meta["sfreq"]), n_members, adapt,
-                                   use_cnn, feats, stage, prep, ae)
-        if state is not None:
-            model.load_state_dict(state)
+            model = ensemble_from_state(state, meta["n_chans"],
+                                        meta["n_times"], float(meta["sfreq"]))
+            return model.to(meta["device"]).eval()
+        n_members = CV_FOLDS * CV_SEEDS if CV_FOLDS > 0 else N_SEEDS
+        model = SleepOnsetEnsemble(
+            meta["n_chans"], meta["n_times"], float(meta["sfreq"]),
+            n_members, ADAPT, USE_CNN, FEATS, STAGE_WEIGHT > 0, PREP,
+            AE_MODE, dom=bool(EXTERNAL) and CV_FOLDS > 0)
         return model.to(meta["device"]).eval()
 
     def fit(self, model, train_loader):
@@ -998,7 +1121,7 @@ class Solver(CompetSolver):
         ensemble = [torch.stack(ps).mean(0) for ps in zip(*member_probas)]
         q, score = min(_scores(ensemble, y_all, val_recs).items(),
                        key=lambda kv: kv[1])
-        model.quantile.fill_(q)
+        model.set_quantile(q)
         model.to(out_device).eval()
         print(f"[CNN-GRU] ensemble val W-bMAE {score:.1f} s, q={q:.2f}")
         _save_val_predictions(
@@ -1065,7 +1188,7 @@ class Solver(CompetSolver):
         # Folds over sleepers.
         fold_subjects = np.random.default_rng(SEED + 1).permutation(
             np.unique([s for _, s in recs]))
-        K = len(model.members)
+        K = len(model.members) // max(1, CV_SEEDS)
         fold_of = {s: k for k, part in enumerate(np.array_split(
             fold_subjects, K)) for s in part}
         rec_fold = np.array([fold_of[s] for _, s in recs])
@@ -1102,18 +1225,47 @@ class Solver(CompetSolver):
 
         print(f"[CNN-GRU] training on {device}")
 
-        oof = [None] * len(recs)
-        for k, member in enumerate(model.members):
-            tr = [r for r, f in zip(recs, rec_fold) if f != k]
+        # External pseudo-Muse PSG recordings: training-only, every fold.
+        ext_recs, ext_mask = [], None
+        if EXTERNAL and model.members[0].dom:
+            X_e, y_e, rec_e, onset_e, sub_e, ds_e = _load_external(EXTERNAL)
+            n0, rec_off = len(y_all), int(rec.max()) + 1
+            _, sub_e_int = np.unique(sub_e, return_inverse=True)
+            sub_e_int = sub_e_int + int(sub_int.max()) + 1
+            ext_recs = [(idx + n0, s) for idx, s in _recordings(
+                y_e, rec_e, onset_e, sub_e_int, rng)]
+            X_all = torch.cat([X_all, X_e])
+            y_all = torch.cat([y_all, y_e])
+            rec = np.concatenate([rec, rec_e + rec_off])
+            ext_mask = np.zeros(len(y_all), dtype=bool)
+            ext_mask[n0:] = True
+            for idx, _ in ext_recs:
+                weights[id(idx)] = EXT_WEIGHT * _window_weights(
+                    y_all[idx].numpy())
+            print(f"[CNN-GRU] + {len(ext_recs)} external recordings "
+                  f"({', '.join(f'{n} {c}' for n, c in zip(*np.unique(ds_e[[i[0] - n0 for i, _ in ext_recs]], return_counts=True)))}), "
+                  f"{len(y_e)} windows, loss weight x{EXT_WEIGHT}")
+
+        R = len(model.members) // K
+        oof_rep = [[None] * len(recs) for _ in range(R)]
+        for j, member in enumerate(model.members):
+            k, rep_i = j % K, j // K
+            tag = f"fold {k + 1}/{K}" + (f" seed {rep_i + 1}/{R}" if R > 1
+                                          else "")
+            tr = [r for r, f in zip(recs, rec_fold) if f != k] + ext_recs
             va_i = [i for i, f in enumerate(rec_fold) if f == k]
             va = [recs[i] for i in va_i]
             if member.ae:
                 # This fold's autoencoder and feature stats, from its
                 # training sleepers only (keeps the out-of-fold honest).
                 member.to(out_device)
-                tr_idx = np.concatenate([idx for idx, _ in tr])
-                _train_autoencoder(member, X_all, tr_idx, device,
-                                   f"fold {k + 1}/{K}")
+                # Muse windows only: the autoencoder and stats ignore the
+                # external recordings.
+                tr_idx = np.concatenate([idx for idx, _ in tr
+                                         if ext_mask is None
+                                         or not ext_mask[idx[0]]])
+                _train_autoencoder(member, X_all, tr_idx, device, tag,
+                                   seed=MEMBER_SEED + rep_i)
                 s = X_all[rng.choice(tr_idx, min(20000, len(tr_idx)),
                                      replace=False)].float()
                 with torch.no_grad():
@@ -1121,18 +1273,28 @@ class Solver(CompetSolver):
                 member.bp_mean.copy_(f_k.mean(0))
                 member.bp_std.copy_(f_k.std(0).clamp_min(1e-3))
             member.to(device)
-            best = _train_member(member, 1000 * MEMBER_SEED + k, X_all, y_all,
-                                 tr, va, weights, device,
-                                 f"fold {k + 1}/{K}",
-                                 (stage_t, stage_m) if use_stage else None)
-            print(f"[CNN-GRU] fold {k + 1}: {len(tr)} train / {len(va)} "
-                  f"held-out recordings, best held-out W-bMAE {best:.1f} s")
+            best = _train_member(member, 1000 * (MEMBER_SEED + rep_i) + k,
+                                 X_all, y_all, tr, va, weights, device, tag,
+                                 (stage_t, stage_m) if use_stage else None,
+                                 ext_mask)
+            print(f"[CNN-GRU] {tag.replace('/' + str(K), '', 1)}: {len(tr)} "
+                  f"train / {len(va)} held-out recordings, best held-out "
+                  f"W-bMAE {best:.1f} s")
             for i in va_i:
-                oof[i] = _sequence_proba(member, X_all, recs[i][0], device)
+                oof_rep[rep_i][i] = _sequence_proba(member, X_all,
+                                                    recs[i][0], device)
+
+        if R > 1:
+            for r_i, o in enumerate(oof_rep):
+                q_r, s_r = min(_scores(o, y_all, recs).items(),
+                               key=lambda kv: kv[1])
+                print(f"[CNN-GRU] seed {MEMBER_SEED + r_i} alone: out-of-fold "
+                      f"W-bMAE {s_r:.1f} s, q={q_r:.2f}")
+        oof = [torch.stack(ps).mean(0) for ps in zip(*oof_rep)]
 
         all_scores = _scores(oof, y_all, recs)
         q, score = min(all_scores.items(), key=lambda kv: kv[1])
-        model.quantile.fill_(q)
+        model.set_quantile(q)
         model.to(out_device).eval()
 
         def subset(mask):
@@ -1152,6 +1314,7 @@ class Solver(CompetSolver):
         # each predicted by the member that did not train on its sleeper).
         print(f"[CNN-GRU] ensemble val W-bMAE {subset(is_classic):.1f} s "
               f"(out-of-fold, the usual validation recordings)")
+        _save_oof(recs, rec_split, rec_fold, names, y_all, oof, q)
         classic = [r for r, m in zip(recs, is_classic) if m]
         _save_val_predictions(
             classic, rec, sub_int, y_all,
@@ -1164,15 +1327,20 @@ class Solver(CompetSolver):
     def _check_streaming(model, X_all, idx, device):
         """Window-by-window predict must match a whole-sequence forward."""
         idx = idx[:200]
-        p = torch.stack([_sequence_proba(m, X_all, idx, device)
-                         for m in model.members]).mean(0)
-        seq = quantile_seconds(p, model.quantile.item())
+        w = (model.member_w / model.member_w.sum()).to(device)
+        p = (torch.stack([_sequence_proba(m, X_all, idx, device)
+                          for m in model.members]) * w.view(-1, 1, 1)).sum(0)
+        seq = model._seconds(p, 0)
         model.reset_state()
+        t0 = time.time()
         stream = torch.cat([model.predict(X_all[i:i + 1].float().to(device))
                             for i in idx])
+        per_window = (time.time() - t0) / max(1, len(idx))
         model.reset_state()
         diff = (seq.clamp(0, CAP_S) - stream).abs().max().item()
-        print(f"[CNN-GRU] streaming check: max |seq - stream| = {diff:.4f} s")
+        print(f"[CNN-GRU] streaming check: max |seq - stream| = {diff:.4f} s; "
+              f"{len(model.members)} members, {1000 * per_window:.1f} ms per "
+              f"window on {device}")
         if diff > BIN_S:
             raise RuntimeError("streamed predictions differ from the "
                                "sequence forward pass")
