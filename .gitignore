@@ -1,3 +1,9 @@
 # External PSG training windows (235 MB, rebuilt by scripts/prep_external.py)
+external_datasets/
 external_windows/
+external_boas/
+external_sleepedf_st/
+external_p2018/
 external_windows.npz
+partial_models/
+

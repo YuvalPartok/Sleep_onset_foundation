@@ -106,17 +106,27 @@ def tune_q_time(scorer, cdf, recs, q0):
     return best, q_time
 
 
-def greedy(scorer, probas, recs, steps):
-    """Caruana selection with replacement -> (counts per build, score, q)."""
+def greedy(scorer, probas, recs, steps, sizes=None, max_members=None):
+    """Caruana selection with replacement -> (counts per build, score, q).
+
+    ``sizes`` (members per build) and ``max_members`` cap the merged
+    ensemble: a build not yet picked is skipped once it would not fit.
+    """
     counts = np.zeros(len(probas), dtype=int)
     total = np.zeros_like(probas[0], dtype=np.float32)
     best_score, best_q_ = np.inf, 0.5
     for _ in range(steps):
         trials = []
+        used = sum(n for n, c in zip(sizes or [], counts) if c)
         for b, p in enumerate(probas):
+            if (max_members and sizes and not counts[b]
+                    and used + sizes[b] > max_members):
+                continue
             mix = (total + p) / (counts.sum() + 1)
             s, q = best_q(scorer, np.cumsum(mix, 1), recs)
             trials.append((s, q, b))
+        if not trials:
+            break
         s, q, b = min(trials)
         if s >= best_score - 0.01:
             break
@@ -169,6 +179,8 @@ def main() -> int:
     ap.add_argument("builds", nargs="+", help="CV build labels (build/<label>)")
     ap.add_argument("--label", required=True, help="output build name")
     ap.add_argument("--steps", type=int, default=20)
+    ap.add_argument("--max-members", type=int, default=30,
+                    help="cap on the merged ensemble's size (inference time)")
     ap.add_argument("--no-eval", action="store_true",
                     help="skip the benchopt inference-only check (no Muse data)")
     args = ap.parse_args()
@@ -187,6 +199,13 @@ def main() -> int:
             if not np.array_equal(o[key], oofs[0][key]):
                 raise SystemExit(f"{b}: recordings differ from {labels[0]} "
                                  f"({key}); not the same CV setup")
+    import torch
+    sizes = []
+    for b in labels:
+        st = torch.load(ROOT / "build" / b / "weights.pt", map_location="cpu",
+                        weights_only=True)
+        sizes.append(len({k.split(".")[1] for k in st
+                          if k.startswith("members.")}))
     scorer = Scorer(oofs[0])
     probas = [o["proba"].astype(np.float32) for o in oofs]
     rec_fold = oofs[0]["rec_fold"]
@@ -199,12 +218,13 @@ def main() -> int:
     for b, p in zip(labels, probas):
         s, q = best_q(scorer, np.cumsum(p, 1), all_recs)
         singles.append(s)
-        print(f"  {b:28s} {s:6.2f} s  (q={q})")
+        print(f"  {b:28s} {s:6.2f} s  (q={q}, {sizes[len(singles) - 1]} members)")
 
     # Honest check: select and tune on folds 1-4, score fold 5.
     last = int(rec_fold.max())
     fit_r, hold_r = all_recs[rec_fold != last], all_recs[rec_fold == last]
-    counts, _, q = greedy(scorer, probas, fit_r, args.steps)
+    counts, _, q = greedy(scorer, probas, fit_r, args.steps, sizes,
+                          args.max_members)
     _, q_time = tune_q_time(scorer, mix_cdf(probas, counts), fit_r, q)
     cdf = mix_cdf(probas, counts)
     hold_ens = scorer.score(quantile_pred(cdf, q_time[scorer.bucket]), hold_r)
@@ -218,7 +238,8 @@ def main() -> int:
           f"{hold_single:.2f} s")
 
     # Final: fit on all recordings.
-    counts, s_sel, q = greedy(scorer, probas, all_recs, args.steps)
+    counts, s_sel, q = greedy(scorer, probas, all_recs, args.steps, sizes,
+                              args.max_members)
     s_time, q_time = tune_q_time(scorer, mix_cdf(probas, counts), all_recs, q)
     print("\nselected (weight = times picked):")
     for b, c in zip(labels, counts):
@@ -229,7 +250,6 @@ def main() -> int:
           f"(q_time={q_time.tolist()} for <{TIME_EDGES_MIN} min)")
 
     mod = load_solver()
-    import torch
     state = merge_states(labels, counts, q_time, mod)
     model = mod.ensemble_from_state(dict(state), 4, 640, 128.0)
     out_dir = ROOT / "build" / args.label

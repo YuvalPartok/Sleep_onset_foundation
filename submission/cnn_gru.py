@@ -141,8 +141,23 @@ L1_WEIGHT = float(os.environ.get("SLEEP_L1", 0.1))
 # External pseudo-Muse PSG windows (scripts/prep_external.py), CV mode only:
 # added to every fold's training set with their loss weight scaled by
 # EXT_WEIGHT; a domain flag input tells them apart (always 0 at inference).
+# SLEEP_EXTERNAL is one file or a comma-separated list; ``path@w`` gives that
+# file its own loss weight instead of EXT_WEIGHT.
 EXTERNAL = os.environ.get("SLEEP_EXTERNAL", "")
 EXT_WEIGHT = float(os.environ.get("SLEEP_EXT_WEIGHT", 0.5))
+
+
+def _external_files(spec=None, default_w=None):
+    """SLEEP_EXTERNAL -> [(path, loss weight)]."""
+    spec = EXTERNAL if spec is None else spec
+    default_w = EXT_WEIGHT if default_w is None else default_w
+    out = []
+    for part in (p.strip() for p in spec.split(",")):
+        if not part:
+            continue
+        path, _, w = part.rpartition("@") if "@" in part else (part, "", "")
+        out.append((path, float(w) if w else default_w))
+    return out
 # Elapsed-time buckets (minutes) of the per-bucket quantile ``q_time``.
 TIME_EDGES_MIN = (2.0, 5.0, 10.0, 20.0)
 QUANTILES = (0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6)
@@ -612,14 +627,14 @@ def _teacher_targets(dataset, onset):
     return target, found
 
 
-def _recordings(y, rec, onset, sub, rng):
+def _recordings(y, rec, onset, sub, rng, pseudo=True):
     """Window indices of each recording, in time order, plus its subject.
 
     Data without real recordings (the Simulated set: one record of random
     windows) is cut into pseudo-recordings sorted by decreasing latency.
     """
     out = []
-    if len(np.unique(rec)) < 4:
+    if pseudo and len(np.unique(rec)) < 4:
         perm = rng.permutation(len(y))
         for i, part in enumerate(np.array_split(perm, 10)):
             part = part[np.argsort(-y[part].numpy(), kind="stable")]
@@ -964,8 +979,18 @@ def _load_external(path):
 
     Windows are raw microvolts (float16); they get the Muse preprocessing.
     """
-    d = np.load(path)
-    X = preprocess(torch.from_numpy(d["X"]).float()).half()
+    if os.path.isdir(path):     # Kaggle unzips an uploaded .npz into a folder
+        d = {k: np.load(os.path.join(path, k + ".npy"),
+                        mmap_mode="r" if k == "X" else None, allow_pickle=False)
+             for k in ("X", "y", "rec", "onset", "subject", "dataset")}
+    else:
+        d = np.load(path)
+    X_raw = d["X"]
+    X = torch.empty(X_raw.shape, dtype=torch.float16)
+    for i in range(0, len(X_raw), 20000):        # keeps the float32 copy small
+        X[i:i + 20000] = preprocess(
+            torch.from_numpy(np.array(X_raw[i:i + 20000])).float()).half()
+    del X_raw
     return (X, torch.from_numpy(d["y"]).float(), d["rec"].astype(np.int64),
             d["onset"].astype(np.float64), d["subject"].astype(str),
             d["dataset"].astype(str))
@@ -1228,23 +1253,31 @@ class Solver(CompetSolver):
         # External pseudo-Muse PSG recordings: training-only, every fold.
         ext_recs, ext_mask = [], None
         if EXTERNAL and model.members[0].dom:
-            X_e, y_e, rec_e, onset_e, sub_e, ds_e = _load_external(EXTERNAL)
-            n0, rec_off = len(y_all), int(rec.max()) + 1
-            _, sub_e_int = np.unique(sub_e, return_inverse=True)
-            sub_e_int = sub_e_int + int(sub_int.max()) + 1
-            ext_recs = [(idx + n0, s) for idx, s in _recordings(
-                y_e, rec_e, onset_e, sub_e_int, rng)]
-            X_all = torch.cat([X_all, X_e])
-            y_all = torch.cat([y_all, y_e])
-            rec = np.concatenate([rec, rec_e + rec_off])
             ext_mask = np.zeros(len(y_all), dtype=bool)
-            ext_mask[n0:] = True
-            for idx, _ in ext_recs:
-                weights[id(idx)] = EXT_WEIGHT * _window_weights(
-                    y_all[idx].numpy())
-            print(f"[CNN-GRU] + {len(ext_recs)} external recordings "
-                  f"({', '.join(f'{n} {c}' for n, c in zip(*np.unique(ds_e[[i[0] - n0 for i, _ in ext_recs]], return_counts=True)))}), "
-                  f"{len(y_e)} windows, loss weight x{EXT_WEIGHT}")
+            n_sub = int(sub_int.max()) + 1
+            for path, w in _external_files():
+                X_e, y_e, rec_e, onset_e, sub_e, ds_e = _load_external(path)
+                n0, rec_off = len(y_all), int(rec.max()) + 1
+                _, sub_e_int = np.unique(sub_e, return_inverse=True)
+                sub_e_int = sub_e_int + n_sub
+                n_sub = int(sub_e_int.max()) + 1
+                new = [(idx + n0, s) for idx, s in _recordings(
+                    y_e, rec_e, onset_e, sub_e_int, rng, pseudo=False)]
+                ext_recs += new
+                X_all = torch.cat([X_all, X_e])
+                y_all = torch.cat([y_all, y_e])
+                rec = np.concatenate([rec, rec_e + rec_off])
+                ext_mask = np.concatenate(
+                    [ext_mask, np.ones(len(y_e), dtype=bool)])
+                for idx, _ in new:
+                    weights[id(idx)] = w * _window_weights(y_all[idx].numpy())
+                names_e, counts_e = np.unique(
+                    ds_e[[i[0] - n0 for i, _ in new]], return_counts=True)
+                print(f"[CNN-GRU] + {len(new)} external recordings "
+                      f"({', '.join(f'{n} {c}' for n, c in zip(names_e, counts_e))}"
+                      f") from {os.path.basename(path)}, {len(y_e)} windows, "
+                      f"loss weight x{w}")
+                del X_e
 
         R = len(model.members) // K
         oof_rep = [[None] * len(recs) for _ in range(R)]
