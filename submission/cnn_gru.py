@@ -83,8 +83,9 @@ RANGE_WEIGHTS = (10.0, 5.0, 3.0, 1.0)
 CNN_CHANNELS = (32, 64, 96, 128)
 BP_DIM = 64
 GRU_HIDDEN = int(os.environ.get("SLEEP_GRU_HIDDEN", 128))
-GRU_LAYERS = 2
-DROPOUT = 0.2
+GRU_LAYERS = int(os.environ.get("SLEEP_GRU_LAYERS", 2))
+DROPOUT = float(os.environ.get("SLEEP_DROPOUT", 0.2))
+RNN = os.environ.get("SLEEP_RNN", "gru").lower()   # see RNN_KINDS
 
 # Training-time choices; inference reads them back from weights.pt.
 N_SEEDS = int(os.environ.get("SLEEP_N_SEEDS", 5))
@@ -109,7 +110,7 @@ STAGE_WEIGHT = float(os.environ.get("SLEEP_STAGE_WEIGHT", 0.0))
 PREP = int(os.environ.get("SLEEP_PREP", 1))     # 2: notch + Welch
 AE_MODE = int(os.environ.get("SLEEP_AE", 0))     # 1 replace, 2 add
 AE_DIM = int(os.environ.get("SLEEP_AE_DIM", 32))  # autoencoder code size
-AE_HIDDEN = 128
+AE_HIDDEN = int(os.environ.get("SLEEP_AE_HIDDEN", 128))
 AE_EPOCHS = int(os.environ.get("SLEEP_AE_EPOCHS", 20))
 LINE_HZ = (48.0, 52.0)                   # mains band skipped with PREP >= 2
 TEACHER_FILE = os.environ.get("SLEEP_TEACHER", os.path.join(
@@ -132,7 +133,21 @@ USE_TEST = os.environ.get("SLEEP_USE_TEST", "0") == "1"
 EPOCHS = int(os.environ.get("SLEEP_EPOCHS", 30))
 PATIENCE = 8
 LR = float(os.environ.get("SLEEP_LR", 1e-3))
-WEIGHT_DECAY = 1e-4
+# Learning-rate schedule: "cosine" (decay to 0 over EPOCHS, the default),
+# "warmcos" (linear warm-up over 3 epochs, then cosine), "plateau" (halve
+# when the validation score stalls for 2 epochs) or "restarts" (cosine
+# restarting every 10 epochs).
+SCHED = os.environ.get("SLEEP_SCHED", "cosine").lower()
+# Start-cut augmentation: the sealed streams (since Nov 16) no longer include
+# the opening minutes of each recording, so elapsed time and the running
+# statistics start some minutes after lights-out. With SLEEP_TRIM_MAX > 0
+# (minutes), each training recording starts, with probability SLEEP_TRIM_P,
+# a uniform 0..TRIM_MAX minutes later (new each epoch), and early stopping
+# scores held-out recordings cut by TRIM_EVAL_MIN (one cut per recording).
+TRIM_MAX = float(os.environ.get("SLEEP_TRIM_MAX", 0.0))
+TRIM_P = float(os.environ.get("SLEEP_TRIM_P", 0.9))
+TRIM_EVAL_MIN = (2, 3, 4, 5, 6, 7)
+WEIGHT_DECAY = float(os.environ.get("SLEEP_WEIGHT_DECAY", 1e-4))
 RECS_PER_BATCH = 16
 CHUNK = int(os.environ.get("SLEEP_CHUNK", 120))  # TBPTT length, windows
 VAL_FRACTION = 0.15
@@ -178,13 +193,260 @@ def quantile_seconds(p, q):
     return (k.clamp_max(N_BINS - 1).squeeze(-1) * BIN_S).float()
 
 
+# --- sequence cores other than nn.GRU / nn.LSTM (SLEEP_RNN) -----------------
+# Each maps z (B, L, H) and a carried state to (out (B, L, H), new state). The
+# state holds exactly what later windows need, so a recording processed in
+# chunks (training) or one window at a time (streamed inference) gives the
+# same outputs. States are tuples of tensors (detached between chunks).
+
+RNN_KINDS = ("gru", "lstm", "tcn", "tf", "lru", "mingru", "mlp")
+RNN_DEFAULT_LAYERS = {"tcn": 6, "tf": 2, "lru": 2, "mingru": 2, "mlp": 2}
+# Tunable core settings: layers of any core (default per kind), the
+# Transformer's attention span in windows (saved with the weights) and the
+# LRU's smallest initial decay rate (initialisation only).
+CORE_LAYERS = os.environ.get("SLEEP_CORE_LAYERS")
+TF_WINDOW = int(os.environ.get("SLEEP_TF_WINDOW", 120))   # 120 = 10 min
+LRU_RMIN = float(os.environ.get("SLEEP_LRU_RMIN", 0.9))
+TF_HEADS = 4
+SCAN_BLOCK = 32                          # block size of the parallel scans
+
+
+def _ff(H, p):
+    return nn.Sequential(nn.LayerNorm(H), nn.Linear(H, 2 * H), nn.GELU(),
+                         nn.Linear(2 * H, H), nn.Dropout(p))
+
+
+class _TCNCore(nn.Module):
+    """Temporal convolutional network: residual blocks of causal dilated
+    convolutions (kernel 3, dilations 1, 2, 4, ...); the state keeps each
+    block's last (k - 1) * dilation inputs."""
+
+    def __init__(self, H, layers, p):
+        super().__init__()
+        self.k = 3
+        self.dil = [2 ** i for i in range(layers)]
+        self.norms = nn.ModuleList(nn.LayerNorm(H) for _ in self.dil)
+        self.convs = nn.ModuleList(nn.Conv1d(H, H, self.k, dilation=d)
+                                   for d in self.dil)
+        self.drop = nn.Dropout(p)
+
+    def forward(self, x, state=None):
+        B, L, H = x.shape
+        new = []
+        for i, (norm, conv, d) in enumerate(zip(self.norms, self.convs,
+                                                self.dil)):
+            pad = (self.k - 1) * d
+            prev = (state[i] if state is not None
+                    else x.new_zeros(B, pad, H))
+            xin = torch.cat([prev, x], dim=1)
+            new.append(xin[:, -pad:])
+            y = conv(norm(xin).transpose(1, 2)).transpose(1, 2)
+            x = x + self.drop(nn.functional.gelu(y))
+        return x, tuple(new)
+
+
+class _TFCore(nn.Module):
+    """Causal Transformer with a sliding attention window of TF_WINDOW
+    windows and ALiBi distance bias (elapsed time is already an input); the
+    state is each layer's key / value cache of the last TF_WINDOW - 1
+    positions."""
+
+    def __init__(self, H, layers, p):
+        super().__init__()
+        self.nh, self.dh = TF_HEADS, H // TF_HEADS
+        self.ln = nn.ModuleList(nn.LayerNorm(H) for _ in range(layers))
+        self.qkv = nn.ModuleList(nn.Linear(H, 3 * H) for _ in range(layers))
+        self.out = nn.ModuleList(nn.Linear(H, H) for _ in range(layers))
+        self.ff = nn.ModuleList(_ff(H, p) for _ in range(layers))
+        self.drop = nn.Dropout(p)
+        self.register_buffer("win", torch.tensor(TF_WINDOW))
+        self.register_buffer("slopes", torch.tensor(
+            [2.0 ** (-8.0 * (h + 1) / TF_HEADS) for h in range(TF_HEADS)]),
+            persistent=False)
+
+    def forward(self, x, state=None):
+        B, L, H = x.shape
+        W = int(self.win)
+        new = []
+        for i in range(len(self.ln)):
+            q, k, v = self.qkv[i](self.ln[i](x)).view(
+                B, L, 3, self.nh, self.dh).permute(2, 0, 3, 1, 4)
+            if state is not None:
+                k = torch.cat([state[2 * i], k], dim=2)
+                v = torch.cat([state[2 * i + 1], v], dim=2)
+            P = k.shape[2] - L
+            new += [k[:, :, -(W - 1):], v[:, :, -(W - 1):]]
+            dist = ((P + torch.arange(L, device=x.device)).view(-1, 1)
+                    - torch.arange(P + L, device=x.device).view(1, -1)).float()
+            bias = -self.slopes.view(-1, 1, 1) * dist
+            bias = bias.masked_fill((dist < 0) | (dist >= W),
+                                    float("-inf"))
+            att = (q @ k.transpose(-1, -2)) / self.dh ** 0.5 + bias
+            y = (att.softmax(-1) @ v).transpose(1, 2).reshape(B, L, H)
+            x = x + self.drop(self.out[i](y))
+            x = x + self.ff[i](x)
+        return x, tuple(new)
+
+
+class _LRUCore(nn.Module):
+    """Linear Recurrent Unit (Orvieto et al. 2023): per layer a diagonal
+    complex linear recurrence h = lam * h + gamma * B u, y = Re(C h) + D u,
+    then a GLU block; computed in real arithmetic with a blockwise parallel
+    scan. The state is each layer's (Re h, Im h)."""
+
+    def __init__(self, H, layers, p, r_min=None, r_max=0.999):
+        r_min = LRU_RMIN if r_min is None else r_min
+        super().__init__()
+        self.H = H
+        g = torch.Generator().manual_seed(0)
+        self.nu_log, self.theta_log, self.gamma_log = (nn.ParameterList(),
+                                                        nn.ParameterList(),
+                                                        nn.ParameterList())
+        self.B_re, self.B_im, self.C_re, self.C_im, self.D = (
+            nn.ParameterList() for _ in range(5))
+        for _ in range(layers):
+            u1, u2 = torch.rand(H, generator=g), torch.rand(H, generator=g)
+            nu = torch.log(-0.5 * torch.log(u1 * (r_max ** 2 - r_min ** 2)
+                                             + r_min ** 2))
+            theta = torch.log(u2 * np.pi / 10 + 1e-4)
+            mag = torch.exp(-torch.exp(nu))
+            self.nu_log.append(nn.Parameter(nu))
+            self.theta_log.append(nn.Parameter(theta))
+            self.gamma_log.append(nn.Parameter(torch.log(torch.sqrt(
+                1 - mag ** 2))))
+            for lst, scale in ((self.B_re, (2 * H) ** -0.5),
+                               (self.B_im, (2 * H) ** -0.5),
+                               (self.C_re, H ** -0.5), (self.C_im, H ** -0.5)):
+                lst.append(nn.Parameter(torch.randn(H, H, generator=g)
+                                        * scale))
+            self.D.append(nn.Parameter(torch.randn(H, generator=g)))
+        self.ln = nn.ModuleList(nn.LayerNorm(H) for _ in range(layers))
+        self.glu = nn.ModuleList(nn.Linear(H, 2 * H) for _ in range(layers))
+        self.ff = nn.ModuleList(_ff(H, p) for _ in range(layers))
+        self.drop = nn.Dropout(p)
+
+    def _scan(self, i, br, bi, hr, hi):
+        """h_t = lam h_{t-1} + b_t over a block (B, S, H), from (hr, hi)."""
+        S = br.shape[1]
+        lmag = -torch.exp(self.nu_log[i])               # log |lam|
+        th = torch.exp(self.theta_log[i])
+        d = (torch.arange(S, device=br.device).view(-1, 1)
+             - torch.arange(S, device=br.device).view(1, -1)).float()
+        keep = (d >= 0).float()
+        dd = d.clamp_min(0).unsqueeze(-1)               # (S, S, 1)
+        pm = torch.exp(dd * lmag) * keep.unsqueeze(-1)
+        pr, pi = pm * torch.cos(dd * th), pm * torch.sin(dd * th)
+        yr = (torch.einsum("tsh,bsh->bth", pr, br)
+              - torch.einsum("tsh,bsh->bth", pi, bi))
+        yi = (torch.einsum("tsh,bsh->bth", pr, bi)
+              + torch.einsum("tsh,bsh->bth", pi, br))
+        t1 = torch.arange(1, S + 1, device=br.device).float().unsqueeze(-1)
+        cm = torch.exp(t1 * lmag)
+        cr, ci = cm * torch.cos(t1 * th), cm * torch.sin(t1 * th)
+        yr = yr + cr * hr.unsqueeze(1) - ci * hi.unsqueeze(1)
+        yi = yi + cr * hi.unsqueeze(1) + ci * hr.unsqueeze(1)
+        return yr, yi
+
+    def forward(self, x, state=None):
+        B, L, H = x.shape
+        new = []
+        for i in range(len(self.ln)):
+            u = self.ln[i](x)
+            gam = torch.exp(self.gamma_log[i])
+            br, bi = (u @ self.B_re[i].T) * gam, (u @ self.B_im[i].T) * gam
+            hr = state[2 * i] if state is not None else x.new_zeros(B, H)
+            hi = state[2 * i + 1] if state is not None else x.new_zeros(B, H)
+            outs_r, outs_i = [], []
+            for s in range(0, L, SCAN_BLOCK):
+                yr, yi = self._scan(i, br[:, s:s + SCAN_BLOCK],
+                                    bi[:, s:s + SCAN_BLOCK], hr, hi)
+                outs_r.append(yr), outs_i.append(yi)
+                hr, hi = yr[:, -1], yi[:, -1]
+            new += [hr, hi]
+            hr_s, hi_s = torch.cat(outs_r, 1), torch.cat(outs_i, 1)
+            y = hr_s @ self.C_re[i].T - hi_s @ self.C_im[i].T + self.D[i] * u
+            x = x + self.drop(nn.functional.glu(
+                self.glu[i](nn.functional.gelu(y)), dim=-1))
+            x = x + self.ff[i](x)
+        return x, tuple(new)
+
+
+class _MinGRUCore(nn.Module):
+    """minGRU (Feng et al. 2024): h = (1 - z) h + z h~ with z and h~ from the
+    input only, residual + feed-forward blocks; blockwise parallel scan in
+    log space. The state is each layer's h."""
+
+    def __init__(self, H, layers, p):
+        super().__init__()
+        self.ln = nn.ModuleList(nn.LayerNorm(H) for _ in range(layers))
+        self.lin = nn.ModuleList(nn.Linear(H, 2 * H) for _ in range(layers))
+        self.ff = nn.ModuleList(_ff(H, p) for _ in range(layers))
+        self.drop = nn.Dropout(p)
+
+    def forward(self, x, state=None):
+        B, L, H = x.shape
+        new = []
+        for i in range(len(self.ln)):
+            zg, hc = self.lin[i](self.ln[i](x)).chunk(2, dim=-1)
+            log_a = -nn.functional.softplus(zg)            # log(1 - z)
+            b = torch.sigmoid(zg) * hc
+            h = state[i] if state is not None else x.new_zeros(B, H)
+            outs = []
+            for s in range(0, L, SCAN_BLOCK):
+                la, bb = log_a[:, s:s + SCAN_BLOCK], b[:, s:s + SCAN_BLOCK]
+                c = la.cumsum(1)                             # (B, S, H)
+                diff = c.unsqueeze(2) - c.unsqueeze(1)       # (B, t, s, H)
+                S = la.shape[1]
+                mask = torch.tril(torch.ones(S, S, device=x.device,
+                                             dtype=torch.bool))
+                w = torch.exp(diff.masked_fill(~mask.view(1, S, S, 1),
+                                               float("-inf")))
+                y = (w * bb.unsqueeze(1)).sum(2) + torch.exp(c) * h.unsqueeze(1)
+                outs.append(y)
+                h = y[:, -1]
+            new.append(h)
+            x = x + self.drop(torch.cat(outs, 1))
+            x = x + self.ff[i](x)
+        return x, tuple(new)
+
+
+class _MLPCore(nn.Module):
+    """No sequence model: residual feed-forward blocks per window (the inputs
+    already carry the running mean, the short average and elapsed time)."""
+
+    def __init__(self, H, layers, p):
+        super().__init__()
+        self.ff = nn.ModuleList(_ff(H, p) for _ in range(layers))
+
+    def forward(self, x, state=None):
+        for f in self.ff:
+            x = x + f(x)
+        return x, ()
+
+
+_CORES = {"tcn": _TCNCore, "tf": _TFCore, "lru": _LRUCore,
+          "mingru": _MinGRUCore, "mlp": _MLPCore}
+
+
 class SleepOnsetCNNGRU(nn.Module):
     """One member: (B, L, C, T) sequences -> logits (B, L, K) over bins."""
 
     def __init__(self, n_chans, n_times, sfreq, adapt=ADAPT, use_cnn=USE_CNN,
                  feats=FEATS, stage=STAGE_WEIGHT > 0, prep=PREP, ae=AE_MODE,
-                 hidden=GRU_HIDDEN, ae_dim=AE_DIM, ema_s=EMA_S, dom=False):
+                 hidden=GRU_HIDDEN, ae_dim=AE_DIM, ema_s=EMA_S, dom=False,
+                 rnn=RNN, layers=None, ae_hidden=AE_HIDDEN):
         super().__init__()
+        self.rnn_type = str(rnn)
+        if self.rnn_type not in RNN_KINDS:
+            raise ValueError(f"SLEEP_RNN={rnn!r}; expected one of {RNN_KINDS}")
+        if layers is None:
+            layers = (int(CORE_LAYERS) if CORE_LAYERS and self.rnn_type
+                      not in ("gru", "lstm") else
+                      RNN_DEFAULT_LAYERS.get(self.rnn_type, GRU_LAYERS))
+        self.layers = int(layers)
+        self.register_buffer("rnn_kind", torch.tensor(
+            RNN_KINDS.index(self.rnn_type)))
+        self.register_buffer("rnn_layers", torch.tensor(self.layers))
         self.prep, self.ae = int(prep), int(ae)
         self.hidden, self.dom = int(hidden), bool(dom)
         self.register_buffer("ema_s", torch.tensor(float(ema_s)))
@@ -245,8 +507,9 @@ class SleepOnsetCNNGRU(nn.Module):
             ae_in = (n_chans + 1) * bins.shape[1]
             self.register_buffer("spec_mean", torch.zeros(ae_in))
             self.register_buffer("spec_std", torch.ones(ae_in))
-            self.ae_enc = nn.Sequential(nn.Linear(ae_in, AE_HIDDEN), nn.GELU(),
-                                        nn.Linear(AE_HIDDEN, int(ae_dim)))
+            self.ae_enc = nn.Sequential(nn.Linear(ae_in, int(ae_hidden)),
+                                        nn.GELU(),
+                                        nn.Linear(int(ae_hidden), int(ae_dim)))
             self.ae_enc.requires_grad_(False)   # trained beforehand, frozen
         else:
             self.ae_enc = None
@@ -274,8 +537,14 @@ class SleepOnsetCNNGRU(nn.Module):
         self.in_proj = nn.Sequential(
             nn.Linear(cnn_dim + BP_DIM + 1 + int(self.dom), self.hidden),
             nn.GELU(), nn.Dropout(DROPOUT))
-        self.gru = nn.GRU(self.hidden, self.hidden, GRU_LAYERS, batch_first=True,
-                          dropout=DROPOUT)
+        # Recurrent core (attribute keeps its name for old weights.pt files).
+        if self.rnn_type in ("gru", "lstm"):
+            rnn_cls = nn.LSTM if self.rnn_type == "lstm" else nn.GRU
+            self.gru = rnn_cls(self.hidden, self.hidden, self.layers,
+                               batch_first=True,
+                               dropout=DROPOUT if self.layers > 1 else 0.0)
+        else:
+            self.gru = _CORES[self.rnn_type](self.hidden, self.layers, DROPOUT)
         self.head = nn.Sequential(nn.Dropout(DROPOUT),
                                   nn.Linear(self.hidden, N_BINS))
         # Training-only auxiliary head (see module docstring).
@@ -490,6 +759,11 @@ class SleepOnsetEnsemble(nn.Module):
 
     def _step_proba(self, X):
         w = self.member_w / self.member_w.sum()
+        if not torch.is_grad_enabled():
+            if not hasattr(self, "_fast"):
+                self._fast = _FastEnsemble.build(self)
+            if self._fast is not None:
+                return self._fast.step(X, w)
         return (torch.stack([m.step_proba(X) for m in self.members])
                 * w.view(-1, 1, 1)).sum(0)
 
@@ -518,6 +792,176 @@ class SleepOnsetEnsemble(nn.Module):
     def reset_state(self):
         for m in self.members:
             m.reset_state()
+        if getattr(self, "_fast", None) is not None:
+            self._fast.reset()
+
+    def _apply(self, fn, *args, **kwargs):
+        # A device / dtype move invalidates the stacked weights.
+        self.__dict__.pop("_fast", None)
+        return super()._apply(fn, *args, **kwargs)
+
+
+class _FastEnsemble:
+    """Streamed inference with the members stacked: members that share their
+    settings run as one batched computation (einsum over stacked weights, a
+    hand-written GRU), and the spectral features are computed once per
+    window for all members. Same outputs as the per-member path up to
+    float rounding; used for inference only, rebuilt after weight changes.
+    """
+
+    @staticmethod
+    def build(ens):
+        """GRU / LSTM members are stacked; members of other kinds (TCN,
+        Transformer, ...) run through their own step_proba in the same call.
+        None when nothing can be stacked (plain per-member path)."""
+        ms = list(ens.members)
+        if any(m.use_cnn or not m.use_adapt or m.use_peaks for m in ms):
+            return None                 # not covered: per-member path
+        covered = [i for i, m in enumerate(ms) if m.rnn_type in RNN_KINDS]
+        if not covered:
+            return None
+        groups = {}
+        for i in covered:
+            m = ms[i]
+            key = (m.n_feats, m.prep, m.ae, m.hidden, m.ema_alpha, m.dom,
+                   m.rnn_type, m.layers,
+                   m.use_ema, m.bp_mean.numel(),
+                   m.ae_enc[2].weight.shape[0] if m.ae else 0,
+                   m.ae_enc[0].weight.shape[0] if m.ae else 0)
+            groups.setdefault(key, []).append(i)
+        fe = _FastEnsemble(ens, [(k, idx) for k, idx in groups.items()])
+        fe.cov = torch.tensor(sorted(covered))
+        fe.slow = [i for i in range(len(ms)) if i not in set(covered)]
+        return fe
+
+    def __init__(self, ens, groups):
+        self.ens = ens
+        self.groups = []
+        for key, idx in groups:
+            ms = [ens.members[i] for i in idx]
+            st = lambda f: torch.stack([f(m) for m in ms]).detach()
+            g = dict(idx=torch.tensor(idx), m0=ms[0], ae=ms[0].ae,
+                     feat_key=(ms[0].n_feats, ms[0].prep, ms[0].ae),
+                     alpha=ms[0].ema_alpha, dom=ms[0].dom,
+                     use_ema=ms[0].use_ema, H=ms[0].hidden,
+                     lstm=ms[0].rnn_type == "lstm",
+                     kind=ms[0].rnn_type,
+                     cores=[m.gru for m in ms],
+                     bp_mean=st(lambda m: m.bp_mean),
+                     bp_std=st(lambda m: m.bp_std),
+                     P1w=st(lambda m: m.bp_proj[0].weight),
+                     P1b=st(lambda m: m.bp_proj[0].bias),
+                     I1w=st(lambda m: m.in_proj[0].weight),
+                     I1b=st(lambda m: m.in_proj[0].bias),
+                     Hw=st(lambda m: m.head[1].weight),
+                     Hb=st(lambda m: m.head[1].bias),
+                     gru=[tuple(st(lambda m, n=n: getattr(m.gru, f"{n}_l{l}"))
+                                for n in ("weight_ih", "weight_hh",
+                                          "bias_ih", "bias_hh"))
+                          for l in range(ms[0].gru.num_layers)]
+                     if ms[0].rnn_type in ("gru", "lstm") else [])
+            if g["ae"]:
+                g.update(spec_mean=st(lambda m: m.spec_mean),
+                         spec_std=st(lambda m: m.spec_std),
+                         A1w=st(lambda m: m.ae_enc[0].weight),
+                         A1b=st(lambda m: m.ae_enc[0].bias),
+                         A2w=st(lambda m: m.ae_enc[2].weight),
+                         A2b=st(lambda m: m.ae_enc[2].bias))
+            self.groups.append(g)
+        # Member order of the concatenated group outputs -> ensemble order.
+        self.order = torch.argsort(torch.cat([g["idx"] for g in self.groups]))
+        self.reset()
+
+    def reset(self):
+        self.n = 0
+        for g in self.groups:
+            g.update(cum=None, ema=None, h=None)
+
+    @staticmethod
+    def _lin(x, w, b):
+        """x (k, i), stacked weights w (k, o, i), b (k, o) -> (k, o)."""
+        return torch.baddbmm(b.unsqueeze(-1), w, x.unsqueeze(-1)).squeeze(-1)
+
+    def _window(self, x):
+        """One raw window (C, T) -> mixed-in-later member probas (M, K)."""
+        Xf = preprocess(x.float().unsqueeze(0))
+        feats, out = {}, []
+        t = float(np.log1p(self.n * self.groups[0]["m0"].window_s / 60.0))
+        for g in self.groups:
+            m0, k = g["m0"], len(g["idx"])
+            fk = g["feat_key"]
+            if fk not in feats:
+                hand = m0.hand_features(Xf)[0] if g["ae"] != 1 else None
+                aein = m0.ae_input(Xf)[0] if g["ae"] else None
+                feats[fk] = (hand, aein)
+            hand, aein = feats[fk]
+            parts = []
+            if g["ae"]:
+                a = (aein.unsqueeze(0) - g["spec_mean"]) / g["spec_std"]
+                a = nn.functional.gelu(self._lin(a, g["A1w"], g["A1b"]))
+                parts.append(self._lin(a, g["A2w"], g["A2b"]))
+            if g["ae"] != 1:
+                parts.append(hand.unsqueeze(0).expand(k, -1))
+            bp = (torch.cat(parts, 1) - g["bp_mean"]) / g["bp_std"]
+            cum = bp if g["cum"] is None else g["cum"] + bp
+            mean = cum / (self.n + 1)
+            pieces = [bp, bp - mean]
+            if g["use_ema"]:
+                ema = (bp if g["ema"] is None
+                       else g["ema"] + g["alpha"] * (bp - g["ema"]))
+                pieces += [bp - ema, ema - mean]
+                g["ema"] = ema
+            g["cum"] = cum
+            z = nn.functional.gelu(self._lin(torch.cat(pieces, 1),
+                                             g["P1w"], g["P1b"]))
+            extra = [z.new_full((k, 1), t)]
+            if g["dom"]:
+                extra.append(z.new_zeros(k, 1))
+            z = nn.functional.gelu(self._lin(torch.cat([z] + extra, 1),
+                                             g["I1w"], g["I1b"]))
+            H = g["H"]
+            if g["kind"] not in ("gru", "lstm"):
+                # Other cores: shared features and stacked projections above,
+                # then each member's own core on its (1, 1, H) input.
+                sts = g["h"] if g["h"] is not None else [None] * k
+                res = [core(z[j].view(1, 1, H), sts[j])
+                       for j, core in enumerate(g["cores"])]
+                g["h"] = [r[1] for r in res]
+                z = torch.stack([r[0].view(H) for r in res])
+                out.append(self._lin(z, g["Hw"], g["Hb"]).softmax(-1))
+                continue
+            hs = (g["h"] if g["h"] is not None
+                  else [(z.new_zeros(k, H), z.new_zeros(k, H))
+                        for _ in g["gru"]])
+            new_h = []
+            for (wi, wh, bi, bh), (h, c) in zip(g["gru"], hs):
+                gi, gh = self._lin(z, wi, bi), self._lin(h, wh, bh)
+                if g["lstm"]:           # gates i, f, g, o (PyTorch order)
+                    a = gi + gh
+                    c = (torch.sigmoid(a[:, H:2 * H]) * c
+                         + torch.sigmoid(a[:, :H]) * torch.tanh(a[:, 2 * H:3 * H]))
+                    z = torch.sigmoid(a[:, 3 * H:]) * torch.tanh(c)
+                else:
+                    r = torch.sigmoid(gi[:, :H] + gh[:, :H])
+                    u = torch.sigmoid(gi[:, H:2 * H] + gh[:, H:2 * H])
+                    n = torch.tanh(gi[:, 2 * H:] + r * gh[:, 2 * H:])
+                    z = (1 - u) * n + u * h
+                new_h.append((z, c))
+            g["h"] = new_h
+            out.append(self._lin(z, g["Hw"], g["Hb"]).softmax(-1))
+        self.n += 1
+        return torch.cat(out)[self.order.to(z.device)]
+
+    def step(self, X, w):
+        """Next windows (B, C, T) of the current recording -> p (B, K)."""
+        wc = w[self.cov.to(w.device)] if self.slow else w
+        ps = torch.stack([(self._window(x) * wc.view(-1, 1)).sum(0)
+                          for x in X])
+        for j in self.slow:                 # other kinds: their own path
+            ps = ps + w[j] * self.ens.members[j].step_proba(X)
+        for j in self.cov.tolist():         # keep the counters in step
+            self.ens.members[j]._n += X.shape[0]
+        return ps
 
 
 # --- training helpers (local only) ------------------------------------------
@@ -710,7 +1154,8 @@ def _detach(state):
         if isinstance(s, list):
             return [x.detach() for x in s]
         return s.detach()
-    return h.detach(), None if sums is None else tuple(det(s) for s in sums)
+    h = tuple(x.detach() for x in h) if isinstance(h, tuple) else h.detach()
+    return h, None if sums is None else tuple(det(s) for s in sums)
 
 
 @torch.no_grad()
@@ -749,15 +1194,49 @@ def _train_device(default):
     return default
 
 
+def _cut(idx, k, y_all):
+    """Recording window indices without their first k windows, or None when
+    nothing before onset would remain."""
+    k = int(min(k, len(idx) - 1))
+    return idx[k:] if k > 0 and float(y_all[idx[k]]) > 0 else (
+        idx if k <= 0 else None)
+
+
+def _cut_val(val_recs, y_all, window_s=5.0):
+    """Held-out recordings cut as the sealed streams are (TRIM_EVAL_MIN,
+    assigned by recording); recordings that would be empty are dropped."""
+    out = []
+    for idx, s in val_recs:
+        m = TRIM_EVAL_MIN[int(idx[0]) % len(TRIM_EVAL_MIN)]
+        c = _cut(idx, int(round(m * 60 / window_s)), y_all)
+        if c is not None:
+            out.append((c, s))
+    return out or val_recs
+
+
 def _train_member(model, seed, X_all, y_all, train_recs, val_recs, weights,
                   device, tag, stage_all=None, ext_mask=None):
     """Train one member in place; keep its best epoch on validation."""
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
+    if TRIM_MAX > 0:
+        val_recs = _cut_val(val_recs, y_all, model.window_s)
+        max_k = int(round(TRIM_MAX * 60 / model.window_s))
     opt = torch.optim.AdamW([p for p in model.parameters()
                              if p.requires_grad], lr=LR,
                             weight_decay=WEIGHT_DECAY)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, EPOCHS)
+    S = torch.optim.lr_scheduler
+    if SCHED == "warmcos":
+        warm = 3
+        sched = S.LambdaLR(opt, lambda e: (e + 1) / warm if e < warm else
+                           0.5 * (1 + np.cos(np.pi * (e - warm)
+                                             / max(1, EPOCHS - warm))))
+    elif SCHED == "plateau":
+        sched = S.ReduceLROnPlateau(opt, factor=0.5, patience=2)
+    elif SCHED == "restarts":
+        sched = S.CosineAnnealingWarmRestarts(opt, 10)
+    else:
+        sched = S.CosineAnnealingLR(opt, EPOCHS)
 
     best, best_state, bad = float("inf"), None, 0
     for epoch in range(EPOCHS):
@@ -774,6 +1253,14 @@ def _train_member(model, seed, X_all, y_all, train_recs, val_recs, weights,
         running, running_stage, n_rec = 0.0, 0.0, 0
         for batch in batches:
             idxs = [train_recs[i][0] for i in batch]
+            wts = [weights[id(idx)] for idx in idxs]
+            if TRIM_MAX > 0:
+                for b, idx in enumerate(idxs):
+                    if rng.uniform() < TRIM_P:
+                        c = _cut(idx, rng.integers(0, max_k + 1), y_all)
+                        if c is not None:
+                            wts[b] = wts[b][len(idx) - len(c):]
+                            idxs[b] = c
             max_len = max(len(idx) for idx in idxs)
             y = torch.zeros(len(idxs), max_len)
             w = torch.zeros(len(idxs), max_len)
@@ -781,7 +1268,7 @@ def _train_member(model, seed, X_all, y_all, train_recs, val_recs, weights,
             sm = torch.zeros(len(idxs), max_len)
             for b, idx in enumerate(idxs):
                 y[b, :len(idx)] = y_all[idx]
-                w[b, :len(idx)] = weights[id(idx)]
+                w[b, :len(idx)] = wts[b]
                 if use_stage:
                     st[b, :len(idx)] = stage_all[0][idx]
                     sm[b, :len(idx)] = stage_all[1][idx].float()
@@ -820,17 +1307,21 @@ def _train_member(model, seed, X_all, y_all, train_recs, val_recs, weights,
                 opt.step()
                 running += loss.item() * len(idxs)
             n_rec += len(idxs)
-        sched.step()
+        if SCHED != "plateau":
+            sched.step()
 
         probas = [_sequence_proba(model, X_all, idx, device)
                   for idx, _ in val_recs]
         q, score = min(_scores(probas, y_all, val_recs).items(),
                        key=lambda kv: kv[1])
+        if SCHED == "plateau":
+            sched.step(score)
         stage_msg = (f" (stage CE {running_stage / n_rec:.3f})"
                      if use_stage else "")
         print(f"[CNN-GRU {tag}] epoch {epoch + 1}/{EPOCHS} "
               f"loss {running / n_rec:.3f}{stage_msg} val W-bMAE {score:.1f} s "
-              f"(q={q}) {time.time() - t0:.0f} s")
+              f"(q={q}) lr {opt.param_groups[0]['lr']:.1e} "
+              f"{time.time() - t0:.0f} s")
         if score < best:
             best, bad = score, 0
             best_state = {k: v.detach().clone()
@@ -947,6 +1438,15 @@ def member_configs(state):
         for key, val in (("cnn_on", True), ("feats", 1), ("prep_v", 1),
                          ("ae_mode", 0), ("ema_s", 60.0), ("dom_on", False)):
             state.setdefault(pre + key, torch.tensor(val))
+        if (pre + "rnn_kind" in state and RNN_KINDS[int(state[pre + "rnn_kind"])]
+                == "tf"):                     # round 15 Transformers: 10-min span
+            state.setdefault(pre + "gru.win", torch.tensor(120))
+        if pre + "rnn_kind" not in state:     # GRU / LSTM only before round 15
+            hh = state[pre + "gru.weight_hh_l0"]
+            state[pre + "rnn_kind"] = torch.tensor(
+                1 if hh.shape[0] == 4 * hh.shape[1] else 0)
+            state[pre + "rnn_layers"] = torch.tensor(sum(
+                k.startswith(pre + "gru.weight_hh_l") for k in state))
         ae = int(state[pre + "ae_mode"])
         configs.append(dict(
             adapt=bool(state[pre + "adapt"]),
@@ -954,9 +1454,13 @@ def member_configs(state):
             feats=int(state[pre + "feats"]),
             stage=any(k.startswith(pre + "stage_head.") for k in state),
             prep=int(state[pre + "prep_v"]), ae=ae,
-            hidden=int(state[pre + "gru.weight_hh_l0"].shape[1]),
+            hidden=int(state[pre + "in_proj.0.weight"].shape[0]),
+            rnn=RNN_KINDS[int(state[pre + "rnn_kind"])],
+            layers=int(state[pre + "rnn_layers"]),
             ae_dim=int(state[pre + "ae_enc.2.weight"].shape[0]) if ae
             else AE_DIM,
+            ae_hidden=int(state[pre + "ae_enc.0.weight"].shape[0]) if ae
+            else AE_HIDDEN,
             ema_s=float(state[pre + "ema_s"]),
             dom=bool(state[pre + "dom_on"])))
     return configs

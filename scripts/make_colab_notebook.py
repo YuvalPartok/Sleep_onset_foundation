@@ -21,7 +21,9 @@ OUT = ROOT / "colab" / "train_on_colab.ipynb"
 EMBEDDED = sorted((ROOT / "submission").glob("*.py")) + [
     ROOT / "scripts" / "build_submission.py",
     ROOT / "scripts" / "merge_builds.py",
-    ROOT / "scripts" / "prep_external.py"]
+    ROOT / "scripts" / "prep_external.py",
+    ROOT / "scripts" / "trim_oof.py",
+    ROOT / "scripts" / "split_merge.py"]
 REPO = "https://github.com/neural-interfaces26/2026-competition.git"
 # YASA teacher labels (scripts/yasa_check.py -> scripts/make_yasa_teacher.py),
 # embedded so Colab never has to install or run YASA.
@@ -297,7 +299,212 @@ Every run is scored two ways:
 * **test W-bMAE**: the 40 warm-up recordings (sleepers **seen** in training),
   scored inference-only as on Codabench.
 
-**Round 9** (default, `ROUND = 9`) combines round 8's winners and tests the
+**Round 16** (default, `ROUND = 16`) tunes the model types in our best
+ensemble, `r15_merge_all` (GRU, LSTM, Transformer, LRU, minGRU), changing one
+setting at a time from each type's current settings (all with 64
+autoencoder features, all external data at 0.5, start cuts up to 10 min):
+
+| Type | Runs (current setting -> tried) |
+|---|---|
+| Transformer | lr 5e-4 -> 1e-3; 2 -> 3 layers; span 10 -> 5 / 20 min; width 128 -> 256 (dropout 0.3) |
+| LRU | decay init 0.9 -> 0.99 (longer memory); 2 -> 3 layers; width 256; lr 1e-3 -> 5e-4 (40 epochs) |
+| minGRU | 2 -> 3 layers; width 256; lr 5e-4 (40 epochs); third seed of the default |
+| GRU / LSTM | GRU 64 features + width 256; LSTM 64 features + width 256; GRU without external data + 64 features |
+
+16 runs, about 5-6 h. One seed each: seeds vary by up to ~0.9 s, so a
+single run must beat its type's round 15 runs clearly to count as better; the
+merge decides what is kept. Attach the external dataset and **round 15's
+notebook output**; the merge cell splits `r15_merge_all` and `r15_merge_ref`
+back into the round 13 builds they hold. Merges (cut streams): `r16_merge_ref`
+(round 15 + those builds; ~ r15_merge_all), `r16_merge_all` (+ round 16, 30
+models) and `r16_merge_all40` (up to 40, slower). The cell prints every run's
+standalone score by type. Upload if a merge beats `r15_merge_all` (36.69 /
+36.50) on both numbers.
+
+Round 15 results (cut streams, standalone): minGRU 38.34 / 37.88, GRU
+38.35 / 37.76 / 39.13, LSTM 38.63 / 38.71, LRU 39.09 / 38.62, Transformer
+38.98 / 38.88, TCN 38.78 / 39.07, MLP 41.34. Merges (honest / out-of-fold):
+ref 36.96 / 36.70, + minGRU 36.80 / 36.51, + LRU 36.84 / 36.64, + Transformer
+36.90 / 36.65, + TCN or MLP unchanged, new types only 36.96 / 36.79,
+**all 36.69 / 36.50**.
+
+**Round 15** (`ROUND = 15`) tries **other sequence models** on the
+best pipeline (`r13_t_ae64_all05`'s settings: prep v2, hand features + 64-dim
+autoencoder, 30 s average, all external data at 0.5, start cuts up to 10
+min). Only the core between the input projection and the output head
+changes (`SLEEP_RNN`); all are causal and stream one window at a time.
+
+| Runs (seeds) | Core |
+|---|---|
+| `r15_tcn` (0, 1) | temporal convolutional network: 6 causal dilated conv blocks, ~10.5 min receptive field |
+| `r15_tf` (0, 1) | causal Transformer: 2 layers, 4 heads, 10-min sliding attention window, ALiBi; warm-up + cosine, lr 5e-4 |
+| `r15_lru` (0, 1) | Linear Recurrent Unit (diagonal complex state space, the S4/S5/Mamba family core) |
+| `r15_mingru` (0, 1) | minGRU ("Were RNNs all we needed?"): gates from the input only |
+| `r15_mlp` (0) | no sequence model: per-window MLP on the same inputs |
+| `r13_t_lstm_ae64` (1) | LSTM baseline, second seed |
+
+GRU baseline: `r13_t_ae64_all05` seeds 0 / 1 / 2 (cut streams 38.35 / 37.76
+/ 39.13); LSTM: `r13_t_lstm_ae64` seed 0 38.63. About 4-5 h.
+
+Attach the external dataset and **round 14's notebook output** (seeds 1-2 of
+round 13's best builds, and `r14_merge_r13`, which the merge cell splits back
+into round 13's six seed-0 builds). Merges, all on cut streams, 30 models
+max: `r15_merge_ref` (the GRU / LSTM start-cut builds; ~ r14_merge_all),
+`r15_merge_new` (new families only), `r15_merge_all`, and `r15_plus_<family>`
+(ref + one family) for each of the five. The cell then prints every run's
+standalone score (cut / uncut streams) grouped by family. Upload the best
+merge if it beats `r14_merge_all` (36.96 honest / 36.70) on both.
+
+Round 14 results (cut streams): seeds of round 13's five best 37.76-39.13;
+`r14_merge_all` honest 36.96 / out-of-fold 36.70 (`r14_merge_r13` 37.18 /
+36.77); uniform averages of the top 4-22 builds 36.7-36.8.
+
+**Round 14** (`ROUND = 14`) adds seeds 1 and 2 of round 13's five
+best start-cut builds (single seeds varied by up to 0.9 s in round 12, so
+more seeds steady the merge): `r13_t_ext1`, `r13_t_all05`, `r13_t_ema30`,
+`r13_t_lstm_h256`, `r13_t_ae64_all05` -> 10 runs, ~3 h. Attach the external
+dataset and **round 13's notebook output** (it holds the twelve round 13
+builds). Merges, on cut streams: `r14_merge_r13` (round 13 only, should
+reproduce 37.18 / 36.77), `r14_merge_all` (+ the seeds, 30 models) and
+`r14_merge_all40` (the same, up to 40 models). Upload the best if it beats
+`r13_merge_all` on both numbers; prefer the 30-model one unless the 40-model
+one is clearly better (it is slower on Codabench).
+
+Round 13 results (start-cut out-of-fold, cut-stream score): `r13_t_ext1`
+37.86, `r13_t_all05` 38.05, `r13_t_ema30` 38.06, `r13_t_lstm_h256` 38.18,
+`r13_t_ae64_all05` 38.35, `r13_t_lstm_ext1` 38.44, `r13_t_lstm_all05` 38.46,
+`r13_t5_lstm_ae64` 38.47, `r13_t20_lstm_ae64` 38.53, `r13_t_lstm_ae64` 38.63,
+`r13_t_lstm_ema30` 39.15, `r13_t_la_restarts` 39.31 (every earlier build:
+41.06 or worse); merges (honest / out-of-fold) old 38.30 / 37.77,
+**trim = all 37.18 / 36.77**.
+
+**Round 13** (`ROUND = 13`) adapts to the **November 16 sealed
+change**: the opening minutes of every sealed recording are no longer
+delivered, so a stream starts some minutes after lights-out (elapsed time
+and the running statistics restart there). Our models were trained on
+streams from lights-out, and lose 1-4 s on cut streams. Round 13 trains with
+**random start cuts** (`SLEEP_TRIM_MAX`: each training recording starts
+0..10 minutes later with probability 0.9, new each epoch; early stopping is
+scored on cut held-out streams), and the merge cell first replays every
+build on cut held-out streams (`scripts/trim_oof.py`, cuts of 2-7 min, one
+per recording) and selects the merges on those (`_oofT`).
+
+| Run | Settings (+ start cuts up to 10 min) |
+|---|---|
+| `r13_t_ema30`, `r13_t_ext1`, `r13_t_all05` | as `r8_ema30`, `r8_ext1`, `r9_all05` |
+| `r13_t_lstm_ema30`, `r13_t_lstm_ext1`, `r13_t_lstm_all05` | the same with an LSTM |
+| `r13_t_lstm_ae64`, `r13_t_ae64_all05` | 64 autoencoder features, LSTM / GRU |
+| `r13_t5_lstm_ae64`, `r13_t20_lstm_ae64` | cuts up to 5 / 20 min |
+| `r13_t_la_restarts`, `r13_t_lstm_h256` | round 12's best single settings (restarting schedule; LSTM width 256) |
+
+Attach the external dataset, the r9_combined builds dataset, round 11's
+notebook output and (if it finished) round 12's. Merges, capped at 30:
+`r13_merge_old` (earlier builds re-selected on cut streams),
+`r13_merge_trim` (round 13 only) and `r13_merge_all`. Reference on cut
+streams: `r9_combined` as uploaded 40.25; `r12_cut_merge` (round 11's merge
+with quantiles re-tuned for cut streams) 38.18, honest 38.67.
+
+Round 12 results (out-of-fold on uncut streams): `r12_la_restarts` 39.5,
+`r12_lstm_h256` 39.7, `r12_la_lr5e4` / `r12_la_h256_lr5e4` / `r12_la_plateau`
+/ `r12_la_warmcos` / `r12_lstm_ae64_h256` 39.9, `r12_lstm_ae64` 40.0,
+`r12_lstm_ae96` 40.1, `r12_la_lr2e3` 40.2, `r12_lstm_ae128` 40.3,
+`r12_la_h256_lr2e3` 41.1; seeds `r11_lstm_all05_s1` 40.5 (s0 39.6),
+`r11_ae64_all05_s1` 40.2 (s0 39.7), `r11_lstm_ext1_s1` 40.2 (s0 39.9);
+merges (honest / out-of-fold) r11 37.77 / 38.22, all 37.27 / 38.11,
+new 36.78 / 38.29.
+
+**Round 12** (`ROUND = 12`) builds on round 11's winners: the
+**LSTM**, **64 autoencoder features** and **width 256**. `L` = the
+`r11_lstm_all05` settings (LSTM, 30 s average, all external data at 0.5);
+`LA` = `L` + 64 autoencoder features. 15 runs, ~12-20 min each on Kaggle
+(~4 h in all):
+
+| Group | Runs |
+|---|---|
+| Architecture / autoencoder size | `r12_lstm_ae64` (LA), `r12_lstm_ae96`, `r12_lstm_ae128` (autoencoder hidden 256), `r12_lstm_h256`, `r12_lstm_ae64_h256` |
+| Learning rate x width (centre lr 1e-3: the two rows above) | `r12_la_lr5e4` (40 epochs), `r12_la_lr2e3`, `r12_la_h256_lr5e4`, `r12_la_h256_lr2e3` |
+| Learning-rate schedule (default: cosine decay 1e-3 -> 0 over 30 epochs) | `r12_la_warmcos` (3-epoch warm-up, then cosine), `r12_la_plateau` (halve on a 2-epoch stall), `r12_la_restarts` (cosine restarting every 10 epochs) |
+| Second seeds | `r11_lstm_all05_s1`, `r11_ae64_all05_s1`, `r11_lstm_ext1_s1` |
+
+A single run varies by ~0.4 s between seeds, so only grid differences above
+~0.5 s mean much; the merge decides what is kept.
+
+Attach: the external dataset (all four sets), the **r9_combined builds**
+dataset, and **round 11's notebook output** (Add Input -> Your Work ->
+the round 11 version), which holds `results/<run>/weights.pt` for the eight
+round 11 runs. The merge cell builds, capped at 30 models each:
+
+* `r12_merge_r11`: r9_combined's builds + round 11 (should reproduce `r11_merge_all`, 38.22 / 37.77)
+* `r12_merge_all`: + all of round 12
+* `r12_merge_new`: rounds 11-12 LSTM / ae64 builds + round 12 only
+
+Decide: upload the best merge if it beats `r11_merge_all` on both the
+honest and the out-of-fold score.
+
+Round 11 results (out-of-fold): `r11_lstm_all05` 39.60, `r11_ae64_all05`
+39.73, `r11_lstm_ext1` 39.85, `r11_h256_all05` 40.01, `r8_ext1_s1` 40.28,
+`r9_all05_s1` 40.66, `r11_l3_all05` 41.30, `r11_wd_all05` 41.34; merges
+seeds 38.53 / 37.96, nolstm 38.29 / 37.79, **all 38.22 / 37.77** (honest).
+
+**Round 11** (`ROUND = 11`) tries architecture, capacity and
+regularisation variants of our best builds, plus a second seed of the two
+best ones. Each run is judged by what it **adds to `r9_combined` in the
+merge**, not by its own score (a single run varies by about 0.4 s between
+seeds). `A05` = `r9_all05`'s settings (30 s average, all external data at
+weight 0.5); `E1` = `r8_ext1`'s (v1 external, weight 1).
+
+| Run | Change | ~Time (T4) |
+|---|---|---|
+| `r11_lstm_all05` | A05 with an LSTM instead of the GRU | ~70 min |
+| `r11_lstm_ext1` | E1 with an LSTM | ~35 min |
+| `r11_h256_all05` | A05, hidden 256 (was 128), dropout 0.3 | ~80 min |
+| `r11_l3_all05` | A05, 3 recurrent layers (was 2), dropout 0.3 | ~75 min |
+| `r11_ae64_all05` | A05, 64 autoencoder features (was 32) | ~60 min |
+| `r11_wd_all05` | A05, weight decay 1e-3 (was 1e-4), dropout 0.3 | ~60 min |
+| `r9_all05_s1` | seed 1 of `r9_all05` | ~60 min |
+| `r8_ext1_s1` | seed 1 of `r8_ext1` | ~30 min |
+
+Attach the same two datasets as round 10 (all four external sets, and the
+r9_combined builds). The merge cell builds three ensembles, each capped at
+30 models, and prints them side by side with `r9_combined` as reference:
+
+* `r11_merge_seeds`: r9_combined's builds + the two new seeds
+* `r11_merge_all`: r9_combined's builds + all eight new runs
+* `r11_merge_nolstm`: the same without the LSTM runs (what the LSTM adds)
+
+Decide: upload only if a merge beats `r9_combined` (38.61 out-of-fold,
+38.01 honest) by at least 0.5 s on **both** numbers.
+
+Round 10 results (out-of-fold, without -> with CNN): ema30 40.50 -> 41.20,
+ext1 39.93 -> 40.81, all05 40.24 -> 41.15, all_s3g 41.19 -> 42.73; merges
+base 38.61 / 38.01, cnn 39.39 / 38.67, all8 38.48 / 38.14. The CNN does not help.
+
+**Round 10** (`ROUND = 10`) asks whether the raw-signal **CNN**
+improves our best ensemble, `r9_combined` (round 8's `ema30` and `ext1` +
+round 9's `all05` and `all_s3g`; 38.61 s out-of-fold, 38.01 honest). Its four
+builds are retrained with the CNN added and everything else unchanged:
+
+| Run | Same settings as | ~Time (T4) |
+|---|---|---|
+| `r10_cnn_ema30` | `r8_ema30` (no external data, 30 s average) | ~20 min |
+| `r10_cnn_ext1` | `r8_ext1` (v1 external, weight 1) | ~30 min |
+| `r10_cnn_all05` | `r9_all05` (all external, weight 0.5) | ~60 min |
+| `r10_cnn_all_s3g` | `r9_all_s3g` (all external, weight 1, sigma 3, GRU 192) | ~60 min |
+
+Attach: the external dataset (all four sets) and the **r9_combined builds**
+dataset (`r8_ema30_s0`, `r8_ext1_s0`, `r9_all05_s0`, `r9_all_s3g_s0`, each a
+folder with `weights.pt` plus its `_oof.npz` and `_eval.parquet`). The
+merge cell then builds three ensembles and prints them side by side:
+
+* `r10_merge_base`: the four existing builds (should reproduce 38.61 / 38.01)
+* `r10_merge_cnn`: the four CNN builds
+* `r10_merge_all8`: all eight, the merge picks (capped at 40 models)
+
+Round 9 results (out-of-fold): `r9_all05` 40.24, `r9_best` 40.62,
+`r9_best_s3g` 40.83, `r9_all` 40.91, `r9_all_s3g` 41.19, `r9_v1w2` 41.38;
+`r9_merged` 38.99; round 8 + round 9 (`r9_combined`) 38.61.
+
+**Round 9** (`ROUND = 9`) combined round 8's winners and tests the
 new external data. Base = combo + **30 s short-term average** (`ema30`); all
 5-fold cross-validated on the 540 recordings, one seed:
 
@@ -486,7 +693,7 @@ retrain.
         code("""
 import os, shutil
 
-ROUND = 9
+ROUND = 16
 R5_FEATS = 2                # round 5 base features: 2 (round 4: movement features, 3, were a tie)
 SEEDS = [0, 1, 2]
 RUN_EXPERIMENTS = not RUN_EXTERNAL_PREP   # the experiment runs of ROUND (a prep session trains nothing)
@@ -544,6 +751,153 @@ if "v1" in EXT_FILES:
         print("round 9: no new external files attached; the r9_all* runs are skipped")
 else:
     print("round 9 needs the round 8 external file (external_windows.npz) attached")
+# Round 10: r9_combined's four builds retrained with the raw-signal CNN added
+# (same settings otherwise), to compare the ensemble with and without it.
+R10_BASE = ["r8_ema30_s0", "r8_ext1_s0", "r9_all05_s0", "r9_all_s3g_s0"]
+CNN_ON = {"SLEEP_USE_CNN": "1"}
+R10 = []
+if "v1" in EXT_FILES and EXT_NEW:
+    R10 = [("r10_cnn_ema30",   CNN, {**B9, **CNN_ON}),
+           ("r10_cnn_ext1",    CNN, {**C, **CNN_ON, **ext_env(["v1"], 1.0)}),
+           ("r10_cnn_all05",   CNN, {**B9, **CNN_ON, **ext_env(["v1", *EXT_NEW], 0.5)}),
+           ("r10_cnn_all_s3g", CNN, {**B9, **S3G, **CNN_ON, **ext_env(["v1", *EXT_NEW], 1.0)})]
+elif ROUND == 10:
+    print("round 10 needs all four external datasets attached (v1, p2018, boas, sleepedf_st)")
+# Round 11: architecture / capacity / regularisation variants of the best
+# builds, plus a second seed of the two best ones. Each run is judged by what
+# it adds to r9_combined in the merge, not by its own score. A fourth tuple
+# entry lists the run's seeds (default SEEDS).
+A05 = {**B9, **ext_env(["v1", *EXT_NEW], 0.5)} if "v1" in EXT_FILES else {}
+E1 = {**C, **ext_env(["v1"], 1.0)} if "v1" in EXT_FILES else {}
+R11 = []
+if "v1" in EXT_FILES and EXT_NEW:
+    R11 = [("r11_lstm_all05",  CNN, {**A05, "SLEEP_RNN": "lstm"}),
+           ("r11_lstm_ext1",   CNN, {**E1, "SLEEP_RNN": "lstm"}),
+           ("r11_h256_all05",  CNN, {**A05, "SLEEP_GRU_HIDDEN": "256", "SLEEP_DROPOUT": "0.3"}),
+           ("r11_l3_all05",    CNN, {**A05, "SLEEP_GRU_LAYERS": "3", "SLEEP_DROPOUT": "0.3"}),
+           ("r11_ae64_all05",  CNN, {**A05, "SLEEP_AE_DIM": "64"}),
+           ("r11_wd_all05",    CNN, {**A05, "SLEEP_WEIGHT_DECAY": "1e-3", "SLEEP_DROPOUT": "0.3"}),
+           ("r9_all05",        CNN, A05, [1]),     # same settings as r9_all05_s0
+           ("r8_ext1",         CNN, E1, [1])]      # same settings as r8_ext1_s0
+elif ROUND == 11:
+    print("round 11 needs all four external datasets attached (v1, p2018, boas, sleepedf_st)")
+# Round 12: build on round 11's winners (LSTM, 64 autoencoder features, width
+# 256). L = r11_lstm_all05's settings, LA = L + 64 autoencoder features.
+# (1) architecture combinations and larger autoencoders, (2) a learning-rate
+# x width grid around LA, (3) learning-rate schedules, (4) second seeds.
+R11_LABELS = ["r11_lstm_all05_s0", "r11_lstm_ext1_s0", "r11_h256_all05_s0",
+              "r11_l3_all05_s0", "r11_ae64_all05_s0", "r11_wd_all05_s0",
+              "r9_all05_s1", "r8_ext1_s1"]
+L = {**A05, "SLEEP_RNN": "lstm"}
+LA = {**L, "SLEEP_AE_DIM": "64"}
+W256 = {"SLEEP_GRU_HIDDEN": "256", "SLEEP_DROPOUT": "0.3"}
+SLOW = {"SLEEP_LR": "5e-4", "SLEEP_EPOCHS": "40"}
+FAST = {"SLEEP_LR": "2e-3"}
+R12 = []
+if "v1" in EXT_FILES and EXT_NEW:
+    R12 = [# (1) architecture / autoencoder size
+           ("r12_lstm_ae64",       CNN, LA),
+           ("r12_lstm_ae96",       CNN, {**L, "SLEEP_AE_DIM": "96"}),
+           ("r12_lstm_ae128",      CNN, {**L, "SLEEP_AE_DIM": "128", "SLEEP_AE_HIDDEN": "256"}),
+           ("r12_lstm_h256",       CNN, {**L, **W256}),
+           ("r12_lstm_ae64_h256",  CNN, {**LA, **W256}),
+           # (2) learning rate x width (centre: lr 1e-3 = the two runs above)
+           ("r12_la_lr5e4",        CNN, {**LA, **SLOW}),
+           ("r12_la_lr2e3",        CNN, {**LA, **FAST}),
+           ("r12_la_h256_lr5e4",   CNN, {**LA, **W256, **SLOW}),
+           ("r12_la_h256_lr2e3",   CNN, {**LA, **W256, **FAST}),
+           # (3) learning-rate schedule (default: cosine decay over 30 epochs)
+           ("r12_la_warmcos",      CNN, {**LA, "SLEEP_SCHED": "warmcos"}),
+           ("r12_la_plateau",      CNN, {**LA, "SLEEP_SCHED": "plateau"}),
+           ("r12_la_restarts",     CNN, {**LA, "SLEEP_SCHED": "restarts"}),
+           # (4) second seeds of round 11's best runs
+           ("r11_lstm_all05",      CNN, L, [1]),
+           ("r11_ae64_all05",      CNN, {**A05, "SLEEP_AE_DIM": "64"}, [1]),
+           ("r11_lstm_ext1",       CNN, {**E1, "SLEEP_RNN": "lstm"}, [1])]
+elif ROUND == 12:
+    print("round 12 needs all four external datasets attached (v1, p2018, boas, sleepedf_st)")
+# Round 13: since Nov 16 the sealed streams start some minutes after
+# lights-out (the opening minutes are no longer delivered). Train with random
+# start cuts (0..SLEEP_TRIM_MAX minutes, new each epoch), and select every
+# merge on start-cut out-of-fold streams (scripts/trim_oof.py, _oofT).
+R12_LABELS = [f"{e[0]}_s{(e[3] if len(e) > 3 else [0])[0]}" for e in R12]
+T10 = {"SLEEP_TRIM_MAX": "10"}
+R13 = []
+if "v1" in EXT_FILES and EXT_NEW:
+    R13 = [("r13_t_ema30",        CNN, {**B9, **T10}),
+           ("r13_t_ext1",         CNN, {**E1, **T10}),
+           ("r13_t_all05",        CNN, {**A05, **T10}),
+           ("r13_t_lstm_ema30",   CNN, {**B9, "SLEEP_RNN": "lstm", **T10}),
+           ("r13_t_lstm_ext1",    CNN, {**E1, "SLEEP_RNN": "lstm", **T10}),
+           ("r13_t_lstm_all05",   CNN, {**L, **T10}),
+           ("r13_t_lstm_ae64",    CNN, {**LA, **T10}),
+           ("r13_t_ae64_all05",   CNN, {**A05, "SLEEP_AE_DIM": "64", **T10}),
+           ("r13_t5_lstm_ae64",   CNN, {**LA, "SLEEP_TRIM_MAX": "5"}),
+           ("r13_t20_lstm_ae64",  CNN, {**LA, "SLEEP_TRIM_MAX": "20"}),
+           # round 12's best single settings: restarting schedule, width 256
+           ("r13_t_la_restarts",  CNN, {**LA, "SLEEP_SCHED": "restarts", **T10}),
+           ("r13_t_lstm_h256",    CNN, {**L, **W256, **T10})]
+elif ROUND == 13:
+    print("round 13 needs all four external datasets attached (v1, p2018, boas, sleepedf_st)")
+# Round 14: seeds 1 and 2 of round 13's five best start-cut builds (cut-stream
+# out-of-fold 37.86-38.35), merged with round 13's builds on cut streams.
+R13_LABELS = [f"{e[0]}_s0" for e in R13]
+R14_BEST = ["r13_t_ext1", "r13_t_all05", "r13_t_ema30", "r13_t_lstm_h256", "r13_t_ae64_all05"]
+R14 = [(e[0], e[1], e[2], [1, 2]) for name in R14_BEST for e in R13 if e[0] == name]
+if ROUND == 14 and not R14:
+    print("round 14 needs all four external datasets attached (v1, p2018, boas, sleepedf_st)")
+# Round 15: other sequence models on the best pipeline (r13_t_ae64_all05's
+# settings: prep v2, hand features + 64-dim autoencoder, 30 s average, all
+# external data at 0.5, start cuts up to 10 min); only the core between the
+# input projection and the output head changes (SLEEP_RNN).
+R14_LABELS = [f"{e[0]}_s{sd}" for e in R14 for sd in e[3]]
+R13_S0_IN_MERGE = ["r13_t_ema30_s0", "r13_t_ext1_s0", "r13_t_ae64_all05_s0",
+                   "r13_t5_lstm_ae64_s0", "r13_t20_lstm_ae64_s0", "r13_t_lstm_h256_s0"]
+FAMILIES = ("tcn", "tf", "lru", "mingru", "mlp")
+R15 = []
+if "v1" in EXT_FILES and EXT_NEW:
+    P15 = {**A05, "SLEEP_AE_DIM": "64", **T10}
+    R15 = [("r15_tcn",    CNN, {**P15, "SLEEP_RNN": "tcn"}, [0, 1]),
+           ("r15_tf",     CNN, {**P15, "SLEEP_RNN": "tf", "SLEEP_SCHED": "warmcos",
+                                "SLEEP_LR": "5e-4"}, [0, 1]),
+           ("r15_lru",    CNN, {**P15, "SLEEP_RNN": "lru"}, [0, 1]),
+           ("r15_mingru", CNN, {**P15, "SLEEP_RNN": "mingru"}, [0, 1]),
+           ("r15_mlp",    CNN, {**P15, "SLEEP_RNN": "mlp"}, [0]),
+           ("r13_t_lstm_ae64", CNN, {**LA, **T10}, [1])]     # LSTM baseline, 2nd seed
+elif ROUND == 15:
+    print("round 15 needs all four external datasets attached (v1, p2018, boas, sleepedf_st)")
+# Round 16: hyperparameters of the model types in r15_merge_all, one setting
+# changed at a time from each type's round 15 / 13 settings (P15 = GRU, 64
+# autoencoder features, all external at 0.5, cuts up to 10 min).
+R15_LABELS = [f"{e[0]}_s{sd}" for e in R15 for sd in e[3]]
+R16 = []
+if "v1" in EXT_FILES and EXT_NEW:
+    TF15 = {**P15, "SLEEP_RNN": "tf", "SLEEP_SCHED": "warmcos", "SLEEP_LR": "5e-4"}
+    LRU15 = {**P15, "SLEEP_RNN": "lru"}
+    MG15 = {**P15, "SLEEP_RNN": "mingru"}
+    D3 = {"SLEEP_DROPOUT": "0.3"}
+    R16 = [# Transformer (round 15: 2 layers, 10-min span, width 128, lr 5e-4)
+           ("r16_tf_lr1e3",     CNN, {**TF15, "SLEEP_LR": "1e-3"}),
+           ("r16_tf_l3",        CNN, {**TF15, "SLEEP_CORE_LAYERS": "3"}),
+           ("r16_tf_w60",       CNN, {**TF15, "SLEEP_TF_WINDOW": "60"}),
+           ("r16_tf_w240",      CNN, {**TF15, "SLEEP_TF_WINDOW": "240"}),
+           ("r16_tf_h256",      CNN, {**TF15, "SLEEP_GRU_HIDDEN": "256", **D3}),
+           # LRU (round 15: 2 layers, decay init 0.9-0.999, width 128, lr 1e-3)
+           ("r16_lru_rmin99",   CNN, {**LRU15, "SLEEP_LRU_RMIN": "0.99"}),
+           ("r16_lru_l3",       CNN, {**LRU15, "SLEEP_CORE_LAYERS": "3"}),
+           ("r16_lru_h256",     CNN, {**LRU15, "SLEEP_GRU_HIDDEN": "256", **D3}),
+           ("r16_lru_lr5e4",    CNN, {**LRU15, "SLEEP_LR": "5e-4", "SLEEP_EPOCHS": "40"}),
+           # minGRU (round 15: 2 layers, width 128, lr 1e-3)
+           ("r16_mingru_l3",    CNN, {**MG15, "SLEEP_CORE_LAYERS": "3"}),
+           ("r16_mingru_h256",  CNN, {**MG15, "SLEEP_GRU_HIDDEN": "256", **D3}),
+           ("r16_mingru_lr5e4", CNN, {**MG15, "SLEEP_LR": "5e-4", "SLEEP_EPOCHS": "40"}),
+           ("r15_mingru",       CNN, MG15, [2]),           # third seed of the best type
+           # GRU / LSTM members (tuned on uncut streams in round 12)
+           ("r16_gru_ae64_h256",  CNN, {**P15, **W256}),
+           ("r16_lstm_ae64_h256", CNN, {**LA, **T10, **W256}),
+           ("r16_gru_ema30_ae64", CNN, {**B9, "SLEEP_AE_DIM": "64", **T10})]
+elif ROUND == 16:
+    print("round 16 needs all four external datasets attached (v1, p2018, boas, sleepedf_st)")
 EXPERIMENTS = {
     1: [  # (name,           solver, env)
         ("gbm_time",         GBM, {"SLEEP_GBM_FEATURES": "time"}),
@@ -584,18 +938,25 @@ EXPERIMENTS = {
     ],
     8: R8,
     9: R9,
+    10: R10,
+    11: R11,
+    12: R12,
+    13: R13,
+    14: R14,
+    15: R15,
+    16: R16,
     3: [
         ("r3_base",          CNN, {**GRU, "SLEEP_STAGE_WEIGHT": "0"}),
         ("r3_stage05",       CNN, {**GRU, "SLEEP_STAGE_WEIGHT": "0.5"}),
         ("r3_stage1",        CNN, {**GRU, "SLEEP_STAGE_WEIGHT": "1.0"}),
     ],
 }[ROUND]
-if ROUND in (4, 5, 7, 8, 9):
+if ROUND in (4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16):
     SEEDS = [0]
 if ROUND == 6:
     SEEDS = [1]     # each run is already a 5-model ensemble over 540 recordings
-RUNS = [(f"{name}_s{seed}", solver, {**env, "SLEEP_SEED": str(seed)})
-        for name, solver, env in EXPERIMENTS for seed in SEEDS
+RUNS = [(f"{e[0]}_s{seed}", e[1], {**e[2], "SLEEP_SEED": str(seed)})
+        for e in EXPERIMENTS for seed in (e[3] if len(e) > 3 else SEEDS)
         if RUN_EXPERIMENTS]
 if RUN_PRODUCTION:
     RUNS.append((PRODUCTION_LABEL, CNN, PRODUCTION_ENV))
@@ -633,7 +994,10 @@ def restore(label):
         return False
     for name in ("eval.parquet", "train.parquet", "valpred.npz", "oof.npz"):
         src = root / f"{label}_{name}"
-        if src.exists():
+        if src.is_dir():        # Kaggle unzipped the .npz: pack it again
+            import numpy as np
+            np.savez(BUILD / src.name, **{f.stem: np.load(f) for f in src.glob("*.npy")})
+        elif src.exists():
             shutil.copy(src, BUILD)
     if (root / label / "weights.pt").exists():      # weights, for merging
         wdir = root / label
@@ -681,7 +1045,7 @@ for label, solver, env_extra in RUNS:
     build(label, solver, env_extra)
 """),
         md("""
-### Merged ensemble (rounds 8 and 9)
+### Merged ensembles (rounds 8-10)
 
 `scripts/merge_builds.py` mixes the finished CV builds of this round (plus
 earlier builds whose results are present: round 9 adds `r8_ema30_s0`,
@@ -694,22 +1058,83 @@ then the final out-of-fold score of the ensemble vs the best single build.
 """),
         code("""
 MERGED = f"r{ROUND}_merged"
+# Round 16: the start-cut GRU / LSTM builds that round 15's merges chose live
+# only inside those merges in round 15's notebook output (split back below).
+R16_SPLITS = [("r15_merge_all", ["r13_t_ae64_all05_s1", "r13_t_ema30_s0",
+                                 "r13_t_lstm_h256_s0", "r15_tf_s0", "r15_lru_s0",
+                                 "r15_mingru_s1"]),
+              ("r15_merge_ref", ["r13_t_ext1_s2", "r13_t_ae64_all05_s1", "r13_t_ema30_s0",
+                                 "r13_t5_lstm_ae64_s0", "r13_t20_lstm_ae64_s0",
+                                 "r13_t_lstm_h256_s0"])]
+R16_SPLIT_LABELS = sorted({l for _, parts in R16_SPLITS for l in parts
+                           if not l.startswith("r15_")})
 EARLIER = {8: ["r7_combo_cv2_s0", "r6_combo_cv_s1"],
            9: ["r8_ema30_s0", "r8_ext1_s0", "r8_sigma3_s0", "r8_gru192_s0",
-               "r7_combo_cv2_s0"]}.get(ROUND, [])
-_have = ROUND >= 8 and any((BUILD / f"{l}_oof.npz").exists() or restore(l) for l, _, _ in RUNS)
-if ROUND >= 8 and not _have:
-    print(f"no finished round {ROUND} runs to merge")
-if _have:
-    for extra in EARLIER:
-        restore(extra)
-    cands = [l for l, _, _ in RUNS] + EARLIER
-    cands = [l for l in cands if (BUILD / f"{l}_oof.npz").exists()]
-    print("merging:", cands)
-    log_path = BUILD / f"{MERGED}.log"
+               "r7_combo_cv2_s0"],
+           10: R10_BASE, 11: R10_BASE,
+           12: R10_BASE + R11_LABELS,
+           13: R10_BASE + R11_LABELS + R12_LABELS,
+           14: R13_LABELS,
+           15: R14_LABELS + R13_S0_IN_MERGE,
+           16: R15_LABELS + R16_SPLIT_LABELS}.get(ROUND, [])
+# Rounds 10 and 11 compare several ensembles; earlier rounds make one.
+NEW = [l for l, _, _ in RUNS]
+if ROUND == 10:
+    MERGES = {"r10_merge_base": R10_BASE, "r10_merge_cnn": NEW,
+              "r10_merge_all8": R10_BASE + NEW}
+elif ROUND == 11:
+    SEED_RUNS = [l for l in NEW if not l.startswith("r11_")]
+    MERGES = {"r11_merge_seeds": R10_BASE + SEED_RUNS,
+              "r11_merge_all": R10_BASE + NEW,
+              "r11_merge_nolstm": R10_BASE + [l for l in NEW if "lstm" not in l]}
+elif ROUND == 12:
+    MERGES = {"r12_merge_r11": R10_BASE + R11_LABELS,     # = r11_merge_all (38.22 / 37.77)
+              "r12_merge_all": R10_BASE + R11_LABELS + NEW,
+              "r12_merge_new": NEW + [l for l in R11_LABELS if "lstm" in l or "ae64" in l]}
+elif ROUND == 13:
+    MERGES = {"r13_merge_old": EARLIER,              # earlier builds, re-selected on cut streams
+              "r13_merge_trim": NEW,                 # round 13 only
+              "r13_merge_all": EARLIER + NEW}
+elif ROUND == 14:
+    MERGES = {"r14_merge_r13": EARLIER,              # should reproduce r13_merge_all (37.18 / 36.77)
+              "r14_merge_all": EARLIER + NEW,        # + the new seeds, capped at 30 models
+              "r14_merge_all40": EARLIER + NEW}      # the same, capped at 40 (slower inference)
+elif ROUND == 16:
+    MERGES = {"r16_merge_ref": EARLIER,                  # ~ r15_merge_all (36.69 / 36.50)
+              "r16_merge_all": EARLIER + NEW,
+              "r16_merge_all40": EARLIER + NEW}          # up to 40 models (slower)
+elif ROUND == 15:
+    FAM = {f: [l for l in NEW if l.startswith(f"r15_{f}_")] for f in FAMILIES}
+    NEW_FAM = [l for f in FAMILIES for l in FAM[f]]
+    REF = EARLIER + [l for l in NEW if l not in NEW_FAM]   # GRU / LSTM start-cut builds
+    MERGES = {"r15_merge_ref": REF,                      # ~ r14_merge_all (36.96 / 36.70)
+              "r15_merge_new": NEW_FAM,                  # new families only
+              "r15_merge_all": REF + NEW_FAM,
+              **{f"r15_plus_{f}": REF + FAM[f] for f in FAMILIES}}
+else:
+    MERGES = {MERGED: NEW + EARLIER}
+MAX_MEMBERS = {10: 40, 11: 30, 12: 30, 13: 30, 14: 30, 15: 30, 16: 30}.get(ROUND, 40)
+# From round 13 on, merges are selected on start-cut streams.
+OOF_SUFFIX = "_oofT" if ROUND >= 13 else "_oof"
+
+def merge(label, cands):
+    if OOF_SUFFIX == "_oofT":
+        have = [l for l in cands if (BUILD / l / "weights.pt").exists()]
+        if have:
+            subprocess.run(["python", "scripts/trim_oof.py", *have], cwd=PROJECT, check=True)
+    missing = [l for l in cands if not (BUILD / l / "weights.pt").exists()]
+    if missing:
+        print(f"{label}: no weights for {missing}; left out")
+    cands = [l for l in cands if (BUILD / f"{l}{OOF_SUFFIX}.npz").exists()
+             and (BUILD / l / "weights.pt").exists()]
+    print(f"===== {label}: merging", cands)
+    if not cands:
+        return
+    log_path = BUILD / f"{label}.log"
     with open(log_path, "w") as log:
-        proc = subprocess.Popen(["python", "scripts/merge_builds.py", "--label", MERGED,
-                                 "--max-members", "30", *cands],
+        proc = subprocess.Popen(["python", "scripts/merge_builds.py", "--label", label,
+                                 "--max-members", str(40 if label.endswith("40") else MAX_MEMBERS),
+                                 "--oof-suffix", OOF_SUFFIX, *cands],
                                 cwd=PROJECT, text=True, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT)
         for line in proc.stdout:
@@ -717,14 +1142,82 @@ if _have:
             if not line.startswith(("+", "[")) or "Error" in line:
                 print(line, end="")
     if proc.wait() != 0:
-        raise RuntimeError(f"merge failed; see {log_path}")
+        raise RuntimeError(f"merge {label} failed; see {log_path}")
     if RESULTS is not None:
         RESULTS.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(BUILD / MERGED, RESULTS / MERGED, dirs_exist_ok=True)
-        for f in run_files(MERGED):
+        shutil.copytree(BUILD / label, RESULTS / label, dirs_exist_ok=True)
+        for f in run_files(label):
             if f.exists():
                 shutil.copy(f, RESULTS)
-        shutil.copy(PROJECT / "dist" / f"{MERGED}.zip", RESULTS)
+        shutil.copy(PROJECT / "dist" / f"{label}.zip", RESULTS)
+
+def merge_summary(label):
+    # (honest fold-5 score, out-of-fold with time quantiles) from a merge log
+    log = BUILD / f"{label}.log"
+    if not log.exists():
+        return None, None
+    txt = log.read_text()
+    h = re.search(r"honest check.*?ensemble ([0-9.]+) s", txt)
+    o = re.search(r"time quantiles ([0-9.]+) s", txt)
+    return (float(h.group(1)) if h else None, float(o.group(1)) if o else None)
+
+import re
+_have = ROUND >= 8 and any((BUILD / f"{l}_oof.npz").exists() or restore(l) for l, _, _ in RUNS)
+if ROUND >= 8 and not _have:
+    print(f"no finished round {ROUND} runs to merge")
+if _have:
+    for extra in EARLIER:
+        if not (BUILD / extra / "weights.pt").exists() and not restore(extra):
+            print(f"{extra}: not attached, left out")
+    # Round 13: round 11's builds are not in round 12's notebook output, but
+    # round 12's merge r12_merge_r11 holds six of them (5 members each, in
+    # this order); split it back into builds when they are missing.
+    # Likewise round 15 gets round 13's seed-0 builds from r14_merge_r13.
+    SPLITS = {13: ("r12_merge_r11", ["r8_ext1_s0", "r9_all05_s0", "r11_lstm_all05_s0",
+                                     "r11_lstm_ext1_s0", "r11_h256_all05_s0",
+                                     "r11_ae64_all05_s0"]),
+              15: ("r14_merge_r13", R13_S0_IN_MERGE)}
+    for merged, parts in (R16_SPLITS if ROUND == 16 else
+                          [SPLITS[ROUND]] if ROUND in SPLITS else []):
+        if any(not (BUILD / l / "weights.pt").exists() for l in parts):
+            if (BUILD / merged / "weights.pt").exists() or restore(merged):
+                subprocess.run(["python", "scripts/split_merge.py", merged, *parts],
+                               cwd=PROJECT, check=True)
+            else:
+                print(f"{merged} not attached: {parts} left out")
+    for label, cands in MERGES.items():
+        merge(label, cands)
+    print("\\nensemble                 honest fold 5   out-of-fold (+ time quantiles)")
+    for label in MERGES:
+        h, o = merge_summary(label)
+        print(f"  {label:22s} {h if h is not None else '-':>10}   {o if o is not None else '-':>10}")
+    if ROUND >= 10:
+        print(f"  {'r9_combined (uploaded)':22s} {38.01:>10}   {38.61:>10}")
+    if ROUND == 12:
+        print(f"  {'r11_merge_all':22s} {37.77:>10}   {38.22:>10}")
+    if ROUND >= 14:
+        print(f"  {'r13_merge_all (uploaded)':22s} {37.18:>10}   {36.77:>10}")
+    if ROUND >= 15 and (BUILD / f"r{ROUND}_merge_all.log").exists():
+        # Standalone scores: cut streams (from the merge log) and uncut
+        # streams (from each run's own log), by family.
+        cut = dict(re.findall(r"^\\s+(\\S+)\\s+([0-9.]+) s\\s+\\(q=",
+                              (BUILD / f"r{ROUND}_merge_all.log").read_text(), re.M))
+        def fam_of(l):
+            for f in FAMILIES:
+                if f"_{f}_" in l or l.startswith(f"r15_{f}"):
+                    return f
+            return "lstm" if "lstm" in l else "gru"
+        print("\\nstandalone (cut streams / uncut streams), by model family:")
+        for f in ("gru", "lstm") + FAMILIES:
+            for l in sorted(x for x in cut if fam_of(x) == f):
+                lg = BUILD / f"{l}.log"
+                m = (re.search(r"out-of-fold W-bMAE ([0-9.]+) s on all", lg.read_text())
+                     if lg.exists() else None)
+                print(f"  {f:7s} {l:24s} {cut[l]:>7}   {m.group(1) if m else '-':>6}")
+    if ROUND >= 13:
+        print("  (round 13 scores are on start-cut streams; references on cut streams:")
+        print(f"  {'r9_combined as uploaded':22s} {'-':>10}   {40.25:>10}")
+        print(f"  {'r12_cut_merge (local)':22s} {38.67:>10}   {38.18:>10})")
 """),
         md("""
 ## 1. Summary
@@ -935,6 +1428,16 @@ blends.round(1)
         md("""
 ## 5. Decide
 
+**Round 10.** Compare the three rows the merge cell prints. A difference
+under ~0.5 s is noise (one training run per build).
+
+* **`r10_merge_cnn` or `r10_merge_all8` at least ~0.5 s below
+  `r10_merge_base` out-of-fold, and also below it on the honest check**:
+  the CNN helps; that merge's ZIP replaces `r9_combined`.
+* Otherwise keep `r9_combined`: the CNN does not pay for its cost.
+* Per build, `r10_cnn_X` vs its twin in `r10_merge_base` shows where the CNN
+  helps (e.g. only with the large external data).
+
 **Round 9.** Only 4 sealed uploads are left, so upload only a clear gain.
 Read the merge cell's output:
 
@@ -1031,7 +1534,7 @@ import zipfile
 
 out = PROJECT / "experiment_results.zip"
 with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-    for label in [l for l, _, _ in RUNS] + ([f"r{ROUND}_merged"] if ROUND >= 8 else []):
+    for label in [l for l, _, _ in RUNS] + (list(MERGES) if ROUND >= 8 else []):
         for f in run_files(label):
             if f.exists():
                 zf.write(f, f.name)

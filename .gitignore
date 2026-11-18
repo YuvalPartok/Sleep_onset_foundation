@@ -7,3 +7,9 @@ external_p2018/
 external_windows.npz
 partial_models/
 
+
+# Local staging for Kaggle dataset uploads
+kaggle_upload/
+
+# Cached public windows for scripts/trim_oof.py (415 MB)
+build/muse_aligned.npz

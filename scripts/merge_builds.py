@@ -44,8 +44,8 @@ TIME_EDGES_MIN = (2.0, 5.0, 10.0, 20.0)
 BIN_S = 5.0
 
 
-def load_oof(label):
-    d = np.load(ROOT / "build" / f"{label}_oof.npz")
+def load_oof(label, suffix="_oof"):
+    d = np.load(ROOT / "build" / f"{label}{suffix}.npz")
     return {k: d[k] for k in d.files}
 
 
@@ -64,6 +64,8 @@ class Scorer:
         present = self.counts > 0
         self.norm = (present * WEIGHTS).sum(1)
         self.present = present
+        # Recordings with a scored window (start-cut oofs drop some).
+        self.valid = self.norm > 0
         self.keep = keep
         minutes = oof["position"] * window_s / 60.0
         self.bucket = np.digitize(minutes, TIME_EDGES_MIN, right=False)
@@ -76,6 +78,7 @@ class Scorer:
         return (means * WEIGHTS).sum(1) / np.maximum(self.norm, 1e-9)
 
     def score(self, pred, recs):
+        recs = recs[self.valid[recs]]
         return float(self.per_recording(pred)[recs].mean())
 
 
@@ -181,19 +184,21 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--max-members", type=int, default=30,
                     help="cap on the merged ensemble's size (inference time)")
+    ap.add_argument("--oof-suffix", default="_oof",
+                    help="_oofT: select on start-cut streams (scripts/trim_oof.py)")
     ap.add_argument("--no-eval", action="store_true",
                     help="skip the benchopt inference-only check (no Muse data)")
     args = ap.parse_args()
 
     labels = [b for b in args.builds
-              if (ROOT / "build" / f"{b}_oof.npz").exists()
+              if (ROOT / "build" / f"{b}{args.oof_suffix}.npz").exists()
               and (ROOT / "build" / b / "weights.pt").exists()]
     missing = sorted(set(args.builds) - set(labels))
     if missing:
-        print(f"skipping (no _oof.npz or weights): {', '.join(missing)}")
+        print(f"skipping (no {args.oof_suffix}.npz or weights): {', '.join(missing)}")
     if not labels:
         raise SystemExit("no usable builds")
-    oofs = [load_oof(b) for b in labels]
+    oofs = [load_oof(b, args.oof_suffix) for b in labels]
     for b, o in zip(labels[1:], oofs[1:]):
         for key in ("record", "position", "y"):
             if not np.array_equal(o[key], oofs[0][key]):
