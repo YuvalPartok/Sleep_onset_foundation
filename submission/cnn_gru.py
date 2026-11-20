@@ -112,6 +112,22 @@ AE_MODE = int(os.environ.get("SLEEP_AE", 0))     # 1 replace, 2 add
 AE_DIM = int(os.environ.get("SLEEP_AE_DIM", 32))  # autoencoder code size
 AE_HIDDEN = int(os.environ.get("SLEEP_AE_HIDDEN", 128))
 AE_EPOCHS = int(os.environ.get("SLEEP_AE_EPOCHS", 20))
+# Feature views (round 18; training only, inference reads the saved weights):
+# SLEEP_AE_KIND = ae (denoising autoencoder) | pca (whitened principal
+# components of the log spectra) | ica (FastICA on those); pca / ica are
+# written into the same Linear-GELU-Linear encoder (exactly linear, see
+# _fit_linear_code). SLEEP_AE_CHANNELS = all | temporal (TP9, TP10) |
+# frontal (AF7, AF8 and AF7-AF8) | temporal_eog (TP9, TP10, AF7-AF8) | tp9 |
+# tp10: the spectra the code sees. SLEEP_FEAT_KEEP
+# < 1: each fold model keeps a random fraction of the hand-crafted features
+# (feature bagging; the others get a huge bp_std, i.e. ~0 input).
+AE_KIND = os.environ.get("SLEEP_AE_KIND", "ae").lower()
+AE_CHANNELS = os.environ.get("SLEEP_AE_CHANNELS", "all").lower()
+# ae_input blocks: 0 TP9, 1 AF7, 2 AF8, 3 TP10, 4 AF7-AF8 (eye movements).
+AE_CHANNEL_BLOCKS = {"all": None, "temporal": (0, 3), "frontal": (1, 2, 4),
+                     "temporal_eog": (0, 3, 4), "tp9": (0,), "tp10": (3,)}
+FEAT_KEEP = float(os.environ.get("SLEEP_FEAT_KEEP", 1.0))
+LINEAR_SHIFT = 50.0          # GELU(x + 50) = x + 50 in float32 for x > -40
 LINE_HZ = (48.0, 52.0)                   # mains band skipped with PREP >= 2
 TEACHER_FILE = os.environ.get("SLEEP_TEACHER", os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data",
@@ -148,6 +164,16 @@ TRIM_MAX = float(os.environ.get("SLEEP_TRIM_MAX", 0.0))
 TRIM_P = float(os.environ.get("SLEEP_TRIM_P", 0.9))
 TRIM_EVAL_MIN = (2, 3, 4, 5, 6, 7)
 WEIGHT_DECAY = float(os.environ.get("SLEEP_WEIGHT_DECAY", 1e-4))
+# Loss-weight flattening (round 17). The metric weights a window by its
+# range's severity over the range's window count (~1.25 per window within
+# 40 s of onset, ~0.017 at 300-600 s), and the loss copied that, so far
+# windows barely train the model. SLEEP_WEIGHT_POW = a trains with those
+# per-window weights raised to a (1 = metric weights, 0 = all windows of a
+# recording alike), i.e. the model learns a distribution tilted by
+# (W_r / n_r)^a, and folds the missing (1 - a) tilt into the output bias
+# (log-space, nominal range lengths) for validation and for the saved
+# weights, so inference is unchanged.
+WEIGHT_POW = float(os.environ.get("SLEEP_WEIGHT_POW", 1.0))
 RECS_PER_BATCH = 16
 CHUNK = int(os.environ.get("SLEEP_CHUNK", 120))  # TBPTT length, windows
 VAL_FRACTION = 0.15
@@ -1105,7 +1131,22 @@ def _window_weights(y):
     for b in present:
         mask = r == b
         w[mask] = RANGE_WEIGHTS[b] / total / mask.sum()
+    if WEIGHT_POW != 1.0:
+        w = w ** WEIGHT_POW
+        w = w / w.sum()
     return torch.as_tensor(w, dtype=torch.float32)
+
+
+def _tilt_bias(device):
+    """(1 - SLEEP_WEIGHT_POW) * log of the metric's per-window weight of each
+    output bin (severity / nominal range length in bins), zero-mean."""
+    values = np.arange(N_BINS) * BIN_S
+    edges = np.asarray(RANGE_EDGES)
+    r = np.clip(np.digitize(values, edges[1:-1]), 0, len(RANGE_WEIGHTS) - 1)
+    n_bins = np.bincount(r, minlength=len(RANGE_WEIGHTS))
+    v = np.log(np.asarray(RANGE_WEIGHTS)[r] / n_bins[r])
+    t = (1.0 - WEIGHT_POW) * (v - v.mean())
+    return torch.as_tensor(t, dtype=torch.float32, device=device)
 
 
 def _soft_labels(y, device):
@@ -1310,6 +1351,10 @@ def _train_member(model, seed, X_all, y_all, train_recs, val_recs, weights,
         if SCHED != "plateau":
             sched.step()
 
+        # The saved model carries the decision tilt (see WEIGHT_POW).
+        tilt = _tilt_bias(device) if WEIGHT_POW != 1.0 else None
+        if tilt is not None:
+            model.head[1].bias.data += tilt
         probas = [_sequence_proba(model, X_all, idx, device)
                   for idx, _ in val_recs]
         q, score = min(_scores(probas, y_all, val_recs).items(),
@@ -1328,8 +1373,10 @@ def _train_member(model, seed, X_all, y_all, train_recs, val_recs, weights,
                           for k, v in model.state_dict().items()}
         else:
             bad += 1
-            if bad >= PATIENCE:
-                break
+        if tilt is not None:
+            model.head[1].bias.data -= tilt
+        if bad >= PATIENCE:
+            break
     model.load_state_dict(best_state)
     model.eval()
     return best
@@ -1350,12 +1397,27 @@ def _train_autoencoder(member, X_all, idx, device, tag, max_windows=80000,
                        for i in range(0, len(idx), 2048)])
     mean, std = S.mean(0), S.std(0).clamp_min(1e-3)
     S = (S - mean) / std
+    blocks = AE_CHANNEL_BLOCKS[AE_CHANNELS]
+    keep = torch.ones(S.shape[1], dtype=torch.bool, device=S.device)
+    if blocks is not None:
+        nb = member.ae_bins.shape[1]
+        keep = torch.zeros_like(keep)
+        for b in blocks:
+            keep[b * nb:(b + 1) * nb] = True
+        S = S * keep
     n_hold = max(1, len(S) // 20)
     S_val, S_tr = S[:n_hold], S[n_hold:]
+    ae_dim = member.ae_enc[2].out_features
+    if AE_KIND in ("pca", "ica"):
+        _fit_linear_code(member, S_tr, S_val, ae_dim, seed, tag, t0)
+        member.spec_mean.copy_(mean)
+        member.spec_std.copy_(torch.where(keep, std, torch.full_like(std, 1e6)))
+        member.ae_enc.requires_grad_(False)
+        member.to(home)
+        return
 
     torch.manual_seed(1000 * (MEMBER_SEED if seed is None else seed)
                       + len(idx))
-    ae_dim = member.ae_enc[2].out_features
     enc = nn.Sequential(nn.Linear(S.shape[1], AE_HIDDEN), nn.GELU(),
                         nn.Linear(AE_HIDDEN, ae_dim)).to(device)
     dec = nn.Sequential(nn.Linear(ae_dim, AE_HIDDEN), nn.GELU(),
@@ -1370,7 +1432,7 @@ def _train_autoencoder(member, X_all, idx, device, tag, max_windows=80000,
             x = S_tr[perm[i:i + 512]]
             # Denoising: Gaussian noise and 10 % of the inputs dropped.
             noisy = (x + 0.1 * torch.randn_like(x)) * (
-                torch.rand_like(x) > 0.1).float()
+                torch.rand_like(x) > 0.1).float() * keep
             loss = ((dec(enc(noisy)) - x) ** 2).mean()
             opt.zero_grad()
             loss.backward()
@@ -1383,10 +1445,67 @@ def _train_autoencoder(member, X_all, idx, device, tag, max_windows=80000,
           f"{ae_dim}: train MSE {total / len(S_tr):.3f}, held-out MSE "
           f"{val:.3f} (1.0 = predicting the mean) {time.time() - t0:.0f} s")
     member.spec_mean.copy_(mean)
-    member.spec_std.copy_(std)
+    member.spec_std.copy_(torch.where(keep, std, torch.full_like(std, 1e6)))
+    with torch.no_grad():
+        enc[0].weight[:, ~keep] = 0.0       # unseen channels: no input
     member.ae_enc.load_state_dict(enc.state_dict())
     member.ae_enc.requires_grad_(False)
     member.to(home)
+
+
+def _fit_linear_code(member, S_tr, S_val, dim, seed, tag, t0):
+    """PCA / ICA code of the standardised spectra, written into the encoder:
+    hidden unit i = GELU(u_i . x + 50) = u_i . x + 50 (i < dim), output =
+    hidden - 50, so the Linear-GELU-Linear encoder computes U x exactly."""
+    hidden = member.ae_enc[0].out_features
+    if dim > hidden:
+        raise ValueError(f"SLEEP_AE_KIND={AE_KIND} needs AE_HIDDEN >= AE_DIM")
+    X = S_tr[:60000].cpu().double()          # float64 on CPU (MPS has none)
+    X = X - X.mean(0)
+    _, sv, vh = torch.linalg.svd(X, full_matrices=False)
+    var = sv[:dim] ** 2 / (len(X) - 1)
+    U = vh[:dim] / var.sqrt().unsqueeze(1)             # whitened PCA
+    explained = float(var.sum() / (sv ** 2 / (len(X) - 1)).sum())
+    if AE_KIND == "ica":
+        from sklearn.decomposition import FastICA
+        Z = (X @ U.T).cpu().numpy()
+        ica = FastICA(n_components=dim, whiten=False, max_iter=500, tol=1e-3,
+                      random_state=int(MEMBER_SEED if seed is None else seed))
+        ica.fit(Z)
+        W = torch.as_tensor(ica.components_, dtype=torch.float64,
+                            device=U.device)
+        U = W @ U
+        U = U / (X @ U.T).std(0).clamp_min(1e-6).unsqueeze(1)   # unit variance
+    enc = member.ae_enc
+    with torch.no_grad():
+        enc[0].weight.zero_()
+        enc[0].bias.zero_()
+        enc[0].weight[:dim] = U.float().to(enc[0].weight.device)
+        enc[0].bias[:dim] = LINEAR_SHIFT
+        enc[2].weight.zero_()
+        enc[2].weight[:, :dim] = torch.eye(dim, device=enc[2].weight.device)
+        enc[2].bias.fill_(-LINEAR_SHIFT)
+    print(f"[CNN-GRU {AE_KIND.upper()} {tag}] {len(S_tr)} windows, "
+          f"{S_tr.shape[1]} inputs -> {dim} components "
+          f"({100 * explained:.0f}% of the variance) {time.time() - t0:.0f} s")
+
+
+def _bag_features(member, seed, tag):
+    """Feature bagging: keep a random FEAT_KEEP of the hand-crafted features
+    (never the autoencoder code); the rest get bp_std = 1e6, i.e. ~0 after
+    normalisation, and so do their running-mean / EMA copies."""
+    n = member.bp_mean.numel()
+    off = member.ae_enc[2].out_features if member.ae == 2 else 0
+    n_hand = n - off if member.ae != 1 else 0
+    if n_hand <= 0:
+        return
+    rng = np.random.default_rng(seed)
+    drop = rng.choice(n_hand, n_hand - max(1, int(round(FEAT_KEEP * n_hand))),
+                      replace=False)
+    with torch.no_grad():
+        member.bp_std[torch.as_tensor(off + drop)] = 1e6
+    print(f"[CNN-GRU {tag}] feature bagging: {n_hand - len(drop)}/{n_hand} "
+          f"hand-crafted features kept")
 
 
 def _subsample_subjects(recs, frac):
@@ -1603,7 +1722,9 @@ class Solver(CompetSolver):
               f"feats={model.members[0].n_feats}, extra={extra is not None}, "
               f"train_frac={TRAIN_FRAC}, seed={MEMBER_SEED}, "
               f"stage_weight={STAGE_WEIGHT if use_stage else 0}, "
-              f"prep={model.members[0].prep}, ae={model.members[0].ae}")
+              f"prep={model.members[0].prep}, ae={model.members[0].ae}, "
+              f"weight_pow={WEIGHT_POW}, ae_kind={AE_KIND}, "
+              f"ae_channels={AE_CHANNELS}, feat_keep={FEAT_KEEP}")
         if use_stage:
             train_idx = np.concatenate([idx for idx, _ in train_recs])
             m = stage_m[train_idx]
@@ -1730,7 +1851,9 @@ class Solver(CompetSolver):
               f"recordings; cnn={model.members[0].use_cnn}, "
               f"feats={model.members[0].n_feats}, "
               f"stage_weight={STAGE_WEIGHT if use_stage else 0}, "
-              f"prep={model.members[0].prep}, ae={model.members[0].ae}")
+              f"prep={model.members[0].prep}, ae={model.members[0].ae}, "
+              f"weight_pow={WEIGHT_POW}, ae_kind={AE_KIND}, "
+              f"ae_channels={AE_CHANNELS}, feat_keep={FEAT_KEEP}")
         if counts["test"]:
             print("[CNN-GRU] note: the warm-up test recordings are in "
                   "training, so this build's test W-bMAE is meaningless")
@@ -1809,6 +1932,8 @@ class Solver(CompetSolver):
                     f_k = member.band_powers(s.to(member.chan_std.device))
                 member.bp_mean.copy_(f_k.mean(0))
                 member.bp_std.copy_(f_k.std(0).clamp_min(1e-3))
+            if FEAT_KEEP < 1.0:
+                _bag_features(member, 10007 * (MEMBER_SEED + rep_i) + k, tag)
             member.to(device)
             best = _train_member(member, 1000 * (MEMBER_SEED + rep_i) + k,
                                  X_all, y_all, tr, va, weights, device, tag,

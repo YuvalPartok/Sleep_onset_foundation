@@ -109,15 +109,23 @@ def tune_q_time(scorer, cdf, recs, q0):
     return best, q_time
 
 
-def greedy(scorer, probas, recs, steps, sizes=None, max_members=None):
+def greedy(scorer, probas, recs, steps, sizes=None, max_members=None,
+           init=None):
     """Caruana selection with replacement -> (counts per build, score, q).
 
     ``sizes`` (members per build) and ``max_members`` cap the merged
     ensemble: a build not yet picked is skipped once it would not fit.
+    ``init`` (counts per build) starts the selection from a given ensemble,
+    so it only grows from there when a pick improves it.
     """
     counts = np.zeros(len(probas), dtype=int)
     total = np.zeros_like(probas[0], dtype=np.float32)
     best_score, best_q_ = np.inf, 0.5
+    if init is not None and np.any(init):
+        counts = np.asarray(init, dtype=int).copy()
+        total = sum(c * p for c, p in zip(counts, probas) if c).astype(np.float32)
+        best_score, best_q_ = best_q(scorer, np.cumsum(total / counts.sum(), 1),
+                                     recs)
     for _ in range(steps):
         trials = []
         used = sum(n for n, c in zip(sizes or [], counts) if c)
@@ -186,6 +194,9 @@ def main() -> int:
                     help="cap on the merged ensemble's size (inference time)")
     ap.add_argument("--oof-suffix", default="_oof",
                     help="_oofT: select on start-cut streams (scripts/trim_oof.py)")
+    ap.add_argument("--init", default="",
+                    help="start the selection from these builds, e.g. "
+                         "r15_tf_s0:1,r15_mingru_s1:2 (counts = weights)")
     ap.add_argument("--no-eval", action="store_true",
                     help="skip the benchopt inference-only check (no Muse data)")
     args = ap.parse_args()
@@ -213,6 +224,16 @@ def main() -> int:
                           if k.startswith("members.")}))
     scorer = Scorer(oofs[0])
     probas = [o["proba"].astype(np.float32) for o in oofs]
+    init = None
+    if args.init:
+        want = dict((kv.split(":")[0], int(kv.split(":")[1]) if ":" in kv else 1)
+                    for kv in args.init.split(","))
+        init = np.array([want.get(b, 0) for b in labels])
+        lost = sorted(set(want) - set(labels))
+        if lost:
+            print(f"--init builds not available, left out: {', '.join(lost)}")
+        print("selection starts from: " + ", ".join(
+            f"{b} x{c}" for b, c in zip(labels, init) if c))
     rec_fold = oofs[0]["rec_fold"]
     all_recs = np.arange(scorer.n_rec)
     print(f"{len(labels)} builds, {scorer.n_rec} recordings, "
@@ -229,7 +250,7 @@ def main() -> int:
     last = int(rec_fold.max())
     fit_r, hold_r = all_recs[rec_fold != last], all_recs[rec_fold == last]
     counts, _, q = greedy(scorer, probas, fit_r, args.steps, sizes,
-                          args.max_members)
+                          args.max_members, init)
     _, q_time = tune_q_time(scorer, mix_cdf(probas, counts), fit_r, q)
     cdf = mix_cdf(probas, counts)
     hold_ens = scorer.score(quantile_pred(cdf, q_time[scorer.bucket]), hold_r)
@@ -244,7 +265,7 @@ def main() -> int:
 
     # Final: fit on all recordings.
     counts, s_sel, q = greedy(scorer, probas, all_recs, args.steps, sizes,
-                              args.max_members)
+                              args.max_members, init)
     s_time, q_time = tune_q_time(scorer, mix_cdf(probas, counts), all_recs, q)
     print("\nselected (weight = times picked):")
     for b, c in zip(labels, counts):
