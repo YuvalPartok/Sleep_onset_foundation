@@ -127,6 +127,19 @@ AE_CHANNELS = os.environ.get("SLEEP_AE_CHANNELS", "all").lower()
 AE_CHANNEL_BLOCKS = {"all": None, "temporal": (0, 3), "frontal": (1, 2, 4),
                      "temporal_eog": (0, 3, 4), "tp9": (0,), "tp10": (3,)}
 FEAT_KEEP = float(os.environ.get("SLEEP_FEAT_KEEP", 1.0))
+# Round 20. SLEEP_SLOPE=1 adds the aperiodic spectral slope per channel to the
+# hand-crafted features: least-squares slope of log power vs log frequency over
+# SLOPE_BANDS (alpha and sigma left out), on the band-power spectrum; saved
+# with the weights. SLEEP_CNN_ONLY=1: the member sees only a CNN's features of
+# the raw signal (DC removed, clipped, 48-52 Hz notched, divided by the
+# recording's running channel std) plus elapsed time; no spectral features;
+# saved with the weights. SLEEP_AE_EXT = comma-separated external datasets
+# (e.g. "hmc,p2018") whose windows are added to the autoencoder's training
+# windows (training only; at most half as many as the Muse windows).
+SLOPE = os.environ.get("SLEEP_SLOPE", "0") == "1"
+SLOPE_BANDS = ((2.0, 7.5), (14.0, 30.0))
+CNN_ONLY = os.environ.get("SLEEP_CNN_ONLY", "0") == "1"
+AE_EXT = os.environ.get("SLEEP_AE_EXT", "")
 LINEAR_SHIFT = 50.0          # GELU(x + 50) = x + 50 in float32 for x > -40
 LINE_HZ = (48.0, 52.0)                   # mains band skipped with PREP >= 2
 TEACHER_FILE = os.environ.get("SLEEP_TEACHER", os.path.join(
@@ -460,8 +473,14 @@ class SleepOnsetCNNGRU(nn.Module):
     def __init__(self, n_chans, n_times, sfreq, adapt=ADAPT, use_cnn=USE_CNN,
                  feats=FEATS, stage=STAGE_WEIGHT > 0, prep=PREP, ae=AE_MODE,
                  hidden=GRU_HIDDEN, ae_dim=AE_DIM, ema_s=EMA_S, dom=False,
-                 rnn=RNN, layers=None, ae_hidden=AE_HIDDEN):
+                 rnn=RNN, layers=None, ae_hidden=AE_HIDDEN, slope=SLOPE,
+                 cnn_only=CNN_ONLY):
         super().__init__()
+        self.cnn_only, self.slope = bool(cnn_only), bool(slope)
+        if self.cnn_only:                    # raw-signal CNN features only
+            use_cnn, ae = True, 0
+        self.register_buffer("cnn_only_on", torch.tensor(self.cnn_only))
+        self.register_buffer("slope_on", torch.tensor(self.slope))
         self.rnn_type = str(rnn)
         if self.rnn_type not in RNN_KINDS:
             raise ValueError(f"SLEEP_RNN={rnn!r}; expected one of {RNN_KINDS}")
@@ -508,6 +527,18 @@ class SleepOnsetCNNGRU(nn.Module):
         masks = torch.stack([((bfreqs >= lo) & (bfreqs < min(hi, nyq))
                               & keep).float() for lo, hi in BANDS])
         self.register_buffer("band_masks", masks, persistent=False)
+        # Spectral slope: least-squares weights over log frequency (zero
+        # outside SLOPE_BANDS, centred), so slope = log power @ slope_w.
+        sel = torch.zeros_like(bfreqs, dtype=torch.bool)
+        for lo, hi in SLOPE_BANDS:
+            sel |= (bfreqs >= lo) & (bfreqs < min(hi, nyq))
+        lf = torch.log(bfreqs.clamp_min(1e-3))
+        xc = torch.where(sel, lf - lf[sel].mean(), torch.zeros_like(lf))
+        self.register_buffer("slope_w", xc / (xc ** 2).sum().clamp_min(1e-9),
+                             persistent=False)
+        self.register_buffer("notch_keep", ((freqs < LINE_HZ[0])
+                                            | (freqs > LINE_HZ[1])).float(),
+                             persistent=False)
         self.register_buffer("seg_hann", torch.hann_window(self.seg),
                              persistent=False)
         self.register_buffer("hann", torch.hann_window(n_times),
@@ -558,10 +589,12 @@ class SleepOnsetCNNGRU(nn.Module):
             bp_in += N_MOVE * len(PEAK_S)
         # Decaying peaks lose 1 normalised unit per PEAK_S seconds.
         self.peak_decay = tuple(self.window_s / h for h in PEAK_S)
-        self.bp_proj = nn.Sequential(nn.Linear(bp_in, BP_DIM), nn.GELU())
+        self.bp_proj = (None if self.cnn_only else
+                        nn.Sequential(nn.Linear(bp_in, BP_DIM), nn.GELU()))
         cnn_dim = 2 * CNN_CHANNELS[-1] if self.use_cnn else 0
         self.in_proj = nn.Sequential(
-            nn.Linear(cnn_dim + BP_DIM + 1 + int(self.dom), self.hidden),
+            nn.Linear(cnn_dim + (0 if self.cnn_only else BP_DIM) + 1
+                      + int(self.dom), self.hidden),
             nn.GELU(), nn.Dropout(DROPOUT))
         # Recurrent core (attribute keeps its name for old weights.pt files).
         if self.rnn_type in ("gru", "lstm"):
@@ -629,6 +662,9 @@ class SleepOnsetCNNGRU(nn.Module):
                        / np.log(p.shape[-1]))
             edge = (p.cumsum(-1) >= 0.95).float().argmax(-1)
             out.append(self.freqs[self.broad_mask][edge] / 30.0)
+        if self.slope:
+            # Aperiodic slope per channel (steeper towards sleep).
+            out.append(torch.log(bspec + 1e-6) @ self.slope_w)
         if self.n_feats >= 3:
             # Movement / arousal markers; the last N_MOVE features. X is
             # already clipped at CLIP_UV, so "clipped" = at that limit.
@@ -650,21 +686,29 @@ class SleepOnsetCNNGRU(nn.Module):
         """
         B, L, C, T = X.shape
         Xf = preprocess(X.reshape(B * L, C, T))
-        bp = ((self.band_powers(Xf) - self.bp_mean) / self.bp_std
-              ).reshape(B, L, -1)
+        if self.cnn_only:
+            Xf = self.notch(Xf)
+            bp = None
+        else:
+            bp = ((self.band_powers(Xf) - self.bp_mean) / self.bp_std
+                  ).reshape(B, L, -1)
         if self.use_adapt:
             var = Xf.var(-1).reshape(B, L, C)
             if sums is None:
-                sums = (bp.new_zeros(B, bp.shape[-1]), var.new_zeros(B, C),
-                        var.new_zeros(B, 1), None, None)
+                sums = (None if bp is None else bp.new_zeros(B, bp.shape[-1]),
+                        var.new_zeros(B, C), var.new_zeros(B, 1), None, None)
             count = sums[2].unsqueeze(1) + torch.arange(
                 1, L + 1, device=X.device).float().view(1, L, 1)
-            cum_bp = sums[0].unsqueeze(1) + bp.cumsum(1)
             cum_var = sums[1].unsqueeze(1) + var.cumsum(1)
-            mean = cum_bp / count
-            rel = bp - mean
             scale = (cum_var / count).sqrt().clamp_min(
                 0.25 * self.chan_std.view(1, 1, C))
+        if self.use_adapt and bp is None:
+            sums = (None, cum_var[:, -1], count[:, -1], None, None)
+            bp_in = None
+        elif self.use_adapt:
+            cum_bp = sums[0].unsqueeze(1) + bp.cumsum(1)
+            mean = cum_bp / count
+            rel = bp - mean
             parts_bp = [bp, rel]
             ema = sums[3]
             if self.use_ema:
@@ -712,9 +756,16 @@ class SleepOnsetCNNGRU(nn.Module):
             d = (torch.zeros(B, device=X.device) if dom is None
                  else dom.to(X.device).float())
             extra.append(d.view(B, 1, 1).expand(B, L, 1))
-        z = self.in_proj(torch.cat(parts + [self.bp_proj(bp_in)] + extra,
-                                   dim=-1))
+        if not self.cnn_only:
+            parts.append(self.bp_proj(bp_in))
+        z = self.in_proj(torch.cat(parts + extra, dim=-1))
         return z, sums
+
+    def notch(self, X):
+        """(N, C, T) -> the same windows with 48-52 Hz removed (per window,
+        zero phase)."""
+        return torch.fft.irfft(torch.fft.rfft(X, dim=-1) * self.notch_keep,
+                               n=X.shape[-1], dim=-1)
 
     def forward(self, X, start_index=0, state=None, return_stage=False,
                 dom=None):
@@ -838,18 +889,21 @@ class _FastEnsemble:
     @staticmethod
     def build(ens):
         """GRU / LSTM members are stacked; members of other kinds (TCN,
-        Transformer, ...) run through their own step_proba in the same call.
+        Transformer, ...) run through their own step_proba in the same call,
+        and so do members with the raw-signal CNN.
         None when nothing can be stacked (plain per-member path)."""
         ms = list(ens.members)
-        if any(m.use_cnn or not m.use_adapt or m.use_peaks for m in ms):
+        if any(not m.use_adapt or m.use_peaks for m in ms):
             return None                 # not covered: per-member path
-        covered = [i for i, m in enumerate(ms) if m.rnn_type in RNN_KINDS]
+        covered = [i for i, m in enumerate(ms)
+                   if m.rnn_type in RNN_KINDS and not m.use_cnn]
         if not covered:
             return None
         groups = {}
         for i in covered:
             m = ms[i]
-            key = (m.n_feats, m.prep, m.ae, m.hidden, m.ema_alpha, m.dom,
+            key = (m.n_feats, m.prep, m.ae, m.slope, m.hidden, m.ema_alpha,
+                   m.dom,
                    m.rnn_type, m.layers,
                    m.use_ema, m.bp_mean.numel(),
                    m.ae_enc[2].weight.shape[0] if m.ae else 0,
@@ -867,7 +921,8 @@ class _FastEnsemble:
             ms = [ens.members[i] for i in idx]
             st = lambda f: torch.stack([f(m) for m in ms]).detach()
             g = dict(idx=torch.tensor(idx), m0=ms[0], ae=ms[0].ae,
-                     feat_key=(ms[0].n_feats, ms[0].prep, ms[0].ae),
+                     feat_key=(ms[0].n_feats, ms[0].prep, ms[0].ae,
+                               ms[0].slope),
                      alpha=ms[0].ema_alpha, dom=ms[0].dom,
                      use_ema=ms[0].use_ema, H=ms[0].hidden,
                      lstm=ms[0].rnn_type == "lstm",
@@ -1555,7 +1610,8 @@ def member_configs(state):
     for i in range(n):
         pre = f"members.{i}."
         for key, val in (("cnn_on", True), ("feats", 1), ("prep_v", 1),
-                         ("ae_mode", 0), ("ema_s", 60.0), ("dom_on", False)):
+                         ("ae_mode", 0), ("ema_s", 60.0), ("dom_on", False),
+                         ("slope_on", False), ("cnn_only_on", False)):
             state.setdefault(pre + key, torch.tensor(val))
         if (pre + "rnn_kind" in state and RNN_KINDS[int(state[pre + "rnn_kind"])]
                 == "tf"):                     # round 15 Transformers: 10-min span
@@ -1581,7 +1637,9 @@ def member_configs(state):
             ae_hidden=int(state[pre + "ae_enc.0.weight"].shape[0]) if ae
             else AE_HIDDEN,
             ema_s=float(state[pre + "ema_s"]),
-            dom=bool(state[pre + "dom_on"])))
+            dom=bool(state[pre + "dom_on"]),
+            slope=bool(state[pre + "slope_on"]),
+            cnn_only=bool(state[pre + "cnn_only_on"])))
     return configs
 
 
@@ -1724,7 +1782,8 @@ class Solver(CompetSolver):
               f"stage_weight={STAGE_WEIGHT if use_stage else 0}, "
               f"prep={model.members[0].prep}, ae={model.members[0].ae}, "
               f"weight_pow={WEIGHT_POW}, ae_kind={AE_KIND}, "
-              f"ae_channels={AE_CHANNELS}, feat_keep={FEAT_KEEP}")
+              f"ae_channels={AE_CHANNELS}, feat_keep={FEAT_KEEP}, "
+              f"slope={SLOPE}, cnn_only={CNN_ONLY}, ae_ext={AE_EXT or None}")
         if use_stage:
             train_idx = np.concatenate([idx for idx, _ in train_recs])
             m = stage_m[train_idx]
@@ -1853,7 +1912,8 @@ class Solver(CompetSolver):
               f"stage_weight={STAGE_WEIGHT if use_stage else 0}, "
               f"prep={model.members[0].prep}, ae={model.members[0].ae}, "
               f"weight_pow={WEIGHT_POW}, ae_kind={AE_KIND}, "
-              f"ae_channels={AE_CHANNELS}, feat_keep={FEAT_KEEP}")
+              f"ae_channels={AE_CHANNELS}, feat_keep={FEAT_KEEP}, "
+              f"slope={SLOPE}, cnn_only={CNN_ONLY}, ae_ext={AE_EXT or None}")
         if counts["test"]:
             print("[CNN-GRU] note: the warm-up test recordings are in "
                   "training, so this build's test W-bMAE is meaningless")
@@ -1878,9 +1938,10 @@ class Solver(CompetSolver):
         print(f"[CNN-GRU] training on {device}")
 
         # External pseudo-Muse PSG recordings: training-only, every fold.
-        ext_recs, ext_mask = [], None
+        ext_recs, ext_mask, ext_ds = [], None, None
         if EXTERNAL and model.members[0].dom:
             ext_mask = np.zeros(len(y_all), dtype=bool)
+            ext_ds = np.full(len(y_all), "", dtype=object)   # source dataset
             n_sub = int(sub_int.max()) + 1
             for path, w in _external_files():
                 X_e, y_e, rec_e, onset_e, sub_e, ds_e = _load_external(path)
@@ -1896,6 +1957,7 @@ class Solver(CompetSolver):
                 rec = np.concatenate([rec, rec_e + rec_off])
                 ext_mask = np.concatenate(
                     [ext_mask, np.ones(len(y_e), dtype=bool)])
+                ext_ds = np.concatenate([ext_ds, ds_e.astype(object)])
                 for idx, _ in new:
                     weights[id(idx)] = w * _window_weights(y_all[idx].numpy())
                 names_e, counts_e = np.unique(
@@ -1924,8 +1986,24 @@ class Solver(CompetSolver):
                 tr_idx = np.concatenate([idx for idx, _ in tr
                                          if ext_mask is None
                                          or not ext_mask[idx[0]]])
-                _train_autoencoder(member, X_all, tr_idx, device, tag,
-                                   seed=MEMBER_SEED + rep_i)
+                ae_idx, max_w = tr_idx, 80000
+                if AE_EXT and ext_ds is not None:
+                    # SLEEP_AE_EXT: also some external windows (at most
+                    # half as many as Muse's) for the autoencoder alone;
+                    # the feature stats below stay Muse-only.
+                    sets = [s.strip() for s in AE_EXT.split(",") if s.strip()]
+                    pool = np.flatnonzero(np.isin(ext_ds, sets))
+                    n_ext = min(len(pool), len(tr_idx) // 2)
+                    pick = np.random.default_rng(7919 * k + rep_i).choice(
+                        pool, n_ext, replace=False)
+                    ae_idx, max_w = np.concatenate([tr_idx, pick]), 80000 + n_ext
+                    print(f"[CNN-GRU AE {tag}] + {n_ext} external windows "
+                          f"({', '.join(sets)}) for the autoencoder")
+                elif AE_EXT:
+                    print(f"[CNN-GRU AE {tag}] SLEEP_AE_EXT needs "
+                          f"SLEEP_EXTERNAL; autoencoder on Muse only")
+                _train_autoencoder(member, X_all, ae_idx, device, tag,
+                                   max_windows=max_w, seed=MEMBER_SEED + rep_i)
                 s = X_all[rng.choice(tr_idx, min(20000, len(tr_idx)),
                                      replace=False)].float()
                 with torch.no_grad():

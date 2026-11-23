@@ -13,3 +13,5 @@ kaggle_upload/
 
 # Cached public windows for scripts/trim_oof.py (415 MB)
 build/muse_aligned.npz
+
+things_to_check.md

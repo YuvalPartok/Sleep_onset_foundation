@@ -1,5 +1,7 @@
 # `r18_merge_free`: how our best submission is built
 
+> **Update:** the final submission is `r20_merge_free40`: this ensemble plus two builds, `r18_ae_temporal_s1` and the raw-signal CNN-only model `r20_cnn_gru_raw_s0`. It scored **34.43** sealed (place 61). See the [README](../README.md).
+
 Track 03 (sleep onset). Sealed score **34.78 s** W-bMAE, 944 s on Codabench (uploaded 2026-11-20).
 Local cut-stream out-of-fold score 36.01 s; honest check (fitted on folds 1–4, scored on fold 5) 36.42 s.
 
